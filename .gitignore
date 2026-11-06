@@ -1,0 +1,33 @@
+# Compiled binaries & build artifacts
+target/
+build/
+dist/
+*.exe
+*.dll
+*.pdb
+*.zip
+
+# Large media binaries
+**/ffmpeg.exe
+**/ffprobe.exe
+
+# Video & output caches
+output/
+*.mp4
+*.mkv
+*.avi
+*.mov
+_temp_frames/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

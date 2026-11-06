@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DashCam360 - 汽車環景魚眼校正與 3D 虛擬投影系統</title>
+  <link rel="stylesheet" href="css/style.css">
+  <!-- Qt WebChannel 支援腳本 (案頭視窗通訊) -->
+  <script src="js/qwebchannel.js"></script>
+  <!-- Three.js 核心與軌道控制器 (已本地快取) -->
+  <script src="js/three.min.js"></script>
+  <script src="js/OrbitControls.js"></script>
+</head>
+<body>
+
+  <!-- 主 3D 渲染區域 -->
+  <div id="viewport-container">
+    <div class="top-header">
+      <div class="brand">
+        <div class="brand-icon">🚘</div>
+        <div>
+          <div class="brand-title">DashCam360 AVM</div>
+          <div class="brand-subtitle">4-Channel Fisheye Rectification & 3D Surround System</div>
+        </div>
+      </div>
+
+      <!-- 快捷視角列 -->
+      <div class="view-preset-bar">
+        <button class="preset-btn active" data-preset="orbit">🔄 自由環繞</button>
+        <button class="preset-btn" data-preset="birdEye">🦅 鳥瞰俯視</button>
+        <button class="preset-btn" data-preset="front">⬆️ 車前視角</button>
+        <button class="preset-btn" data-preset="rear">⬇️ 車後視角</button>
+        <button class="preset-btn" data-preset="left">⬅️ 車左視角</button>
+        <button class="preset-btn" data-preset="right">➡️ 車右視角</button>
+        <button class="preset-btn" data-preset="cockpit">💺 駕駛艙</button>
+      </div>
+    </div>
+
+    <!-- 滑鼠互動懸浮提示 -->
+    <div class="interaction-hint">
+      <div>滑鼠左鍵: <span>360° 旋轉視角</span></div>
+      <div>滾輪: <span>縮放距離</span></div>
+      <div>滑鼠右鍵: <span>平移畫面</span></div>
+      <div>空白鍵: <span>播放 / 暫停</span></div>
+    </div>
+
+    <!-- 底部播放器懸浮控制列 -->
+    <div class="bottom-player-bar">
+      <div class="timeline-row">
+        <span id="time-display" class="time-display">00:00 / 00:00</span>
+        <input type="range" id="timeline-slider" class="timeline-slider" min="0" max="100" value="0" step="0.1">
+      </div>
+      <div class="controls-row">
+        <div class="playback-controls">
+          <button id="btn-play" class="action-btn primary">
+            <span>▶</span> 播放
+          </button>
+          <select id="speed-select" class="speed-select" title="播放倍速">
+            <option value="0.5">0.5x 慢速</option>
+            <option value="1.0" selected>1.0x 正常</option>
+            <option value="1.5">1.5x 快速</option>
+            <option value="2.0">2.0x 兩倍</option>
+          </select>
+        </div>
+
+        <div style="font-size: 11px; color: var(--text-muted);">
+          動態材質：4 路同步高幀率渲染 (VideoTexture)
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右側控制面板 (側邊欄) -->
+  <div id="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-title">⚙️ 控制與校正面板</div>
+    </div>
+
+    <div class="sidebar-content">
+      <!-- 檔案匯入卡片 -->
+      <div class="card">
+        <div class="card-title">📁 匯入 4 分割魚眼影片</div>
+        <div id="dropzone" class="dropzone">
+          <div class="dropzone-icon">📥</div>
+          <div class="dropzone-text">點擊匯入或拖曳影片檔案至此</div>
+          <div class="dropzone-sub">支援 MP4, MOV, MKV, AVI 等格式</div>
+          <input type="file" id="file-input" accept="video/*" style="display: none;">
+        </div>
+        <div id="file-badge" class="file-info-badge">未選取檔案</div>
+        <div style="display: flex; gap: 8px;">
+          <button id="btn-import" class="action-btn" style="flex: 1;">選擇本地檔案</button>
+          <button id="btn-generate-demo" class="action-btn" style="background: rgba(0, 240, 255, 0.15); color: var(--accent-cyan); border-color: rgba(0, 240, 255, 0.3);">
+            🎲 產生示範樣品
+          </button>
+        </div>
+      </div>
+
+      <!-- 象限映射指派卡片 (對應車機前、後、左、右) -->
+      <div class="card">
+        <div class="card-title">🧭 象限方位映射</div>
+        <div style="font-size: 11px; color: var(--text-muted);">
+          依據車機錄製畫面指派各象限對應視角：
+        </div>
+        <div class="quadrant-grid">
+          <div class="quad-box">
+            <span class="quad-label">↖ 左上象限</span>
+            <select id="sel-quad-tl" class="quad-select">
+              <option value="front" selected>前視 (Front)</option>
+              <option value="rear">後視 (Rear)</option>
+              <option value="left">左側 (Left)</option>
+              <option value="right">右側 (Right)</option>
+            </select>
+          </div>
+          <div class="quad-box">
+            <span class="quad-label">↗ 右上象限</span>
+            <select id="sel-quad-tr" class="quad-select">
+              <option value="front">前視 (Front)</option>
+              <option value="rear" selected>後視 (Rear)</option>
+              <option value="left">左側 (Left)</option>
+              <option value="right">右側 (Right)</option>
+            </select>
+          </div>
+          <div class="quad-box">
+            <span class="quad-label">↙ 左下象限</span>
+            <select id="sel-quad-bl" class="quad-select">
+              <option value="front">前視 (Front)</option>
+              <option value="rear">後視 (Rear)</option>
+              <option value="left" selected>左側 (Left)</option>
+              <option value="right">右側 (Right)</option>
+            </select>
+          </div>
+          <div class="quad-box">
+            <span class="quad-label">↘ 右下象限</span>
+            <select id="sel-quad-br" class="quad-select">
+              <option value="front">前視 (Front)</option>
+              <option value="rear">後視 (Rear)</option>
+              <option value="left">左側 (Left)</option>
+              <option value="right" selected>右側 (Right)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- FFmpeg v360 濾鏡拉直參數調校 -->
+      <div class="card">
+        <div class="card-title">📐 FFmpeg v360 校正參數</div>
+        <div class="param-row">
+          <div class="param-header">
+            <span>輸入魚眼視角 (in_fov)</span>
+            <span id="val-in-fov">180°</span>
+          </div>
+          <input type="range" id="param-in-fov" class="param-slider" min="140" max="220" value="180">
+        </div>
+        <div class="param-row">
+          <div class="param-header">
+            <span>拉直輸出視角 (out_hfov)</span>
+            <span id="val-out-fov">110°</span>
+          </div>
+          <input type="range" id="param-out-fov" class="param-slider" min="70" max="140" value="110">
+        </div>
+        <div class="param-row">
+          <div class="param-header">
+            <span>3D 屏幕環繞距離</span>
+            <span id="val-screen-dist">3.6m</span>
+          </div>
+          <input type="range" id="param-screen-dist" class="param-slider" min="2.0" max="6.0" step="0.2" value="3.6">
+        </div>
+      </div>
+
+      <!-- 處理進度卡片 -->
+      <div id="progress-card" class="card progress-card">
+        <div class="card-title">⚡ 處理進度</div>
+        <div class="progress-bar-bg">
+          <div id="progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div id="progress-status" class="progress-status">準備中...</div>
+      </div>
+
+      <!-- 一鍵執行按鈕 -->
+      <button id="btn-process" class="action-btn primary" style="padding: 12px; font-size: 14px; justify-content: center;">
+        🚀 一鍵自動裁切與 v360 魚眼校正
+      </button>
+
+      <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5; text-align: center;">
+        提示：處理將調用 FFmpeg 進行四象限裁切、v360 透視展開拉直，並即時投射至 3D 空間四周。
+      </div>
+    </div>
+  </div>
+
+  <!-- 4 路隱藏影片元件 (由 Three.js VideoTexture 動態捕獲畫面) -->
+  <div class="hidden-videos">
+    <video id="vid-front" playsinline crossOrigin="anonymous"></video>
+    <video id="vid-rear" playsinline crossOrigin="anonymous"></video>
+    <video id="vid-left" playsinline crossOrigin="anonymous"></video>
+    <video id="vid-right" playsinline crossOrigin="anonymous"></video>
+  </div>
+
+  <!-- 應用主邏輯 -->
+  <script src="js/viewer3d.js"></script>
+  <script src="js/player.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
