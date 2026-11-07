@@ -377,34 +377,63 @@ pub fn start_processing(
                 _ => &config.camera_params[0],
             };
 
+            // 疊加 X/Y 平移微調到角度偏量 (每 10cm 平移對應約 1.2° 角度位移)
+            let pitch_val = param.pitch as f32 - param.offset_y * 12.0;
+            let yaw_val = param.yaw as f32 + param.offset_x * 12.0;
+
             let mut rot_args = String::new();
-            if param.pitch != 0 {
-                rot_args.push_str(&format!(":pitch={}", param.pitch));
+            if pitch_val.abs() > 0.05 {
+                rot_args.push_str(&format!(":pitch={:.2}", pitch_val));
             }
-            if param.yaw != 0 {
-                rot_args.push_str(&format!(":yaw={}", param.yaw));
+            if yaw_val.abs() > 0.05 {
+                rot_args.push_str(&format!(":yaw={:.2}", yaw_val));
             }
 
             // 物理安裝方向旋轉 (左側 -90°，右側 +90°) 疊加使用者的微調偏量 param.roll
             let effective_roll = match role.as_str() {
-                "left" => -90 + param.roll,
-                "right" => 90 + param.roll,
-                _ => param.roll,
+                "left" => -90.0 + param.roll as f32,
+                "right" => 90.0 + param.roll as f32,
+                _ => param.roll as f32,
             };
-            if effective_roll != 0 {
-                rot_args.push_str(&format!(":roll={}", effective_roll));
+            if effective_roll.abs() > 0.05 {
+                rot_args.push_str(&format!(":roll={:.2}", effective_roll));
             }
+
+            // 根據使用者在 UI 上拖動的 Zoom 縮放倍率，動態調節展開 FOV (達成光學無損 Zoom)
+            let safe_zoom = param.zoom.clamp(0.4, 3.0);
+            let effective_hfov = ((param.out_hfov as f32 / safe_zoom).clamp(25.0, 160.0)) as i32;
+            let effective_vfov = ((param.out_vfov as f32 / safe_zoom).clamp(25.0, 140.0)) as i32;
 
             // 指定 w=960:h=540，確保所有 4 路輸出的幾何尺寸完全嚴格一致，防止 vstack 產生寬度不合之 error -22
             filter_parts.push(format!(
                 "[0:v]{crop},v360=input=fisheye:output=rectilinear:ih_fov={}:iv_fov={}:h_fov={}:v_fov={}{rot_args}:w=960:h=540,format=yuv420p,split=2[{role}][{role}_q]",
-                param.in_fov, param.in_fov, param.out_hfov, param.out_vfov
+                param.in_fov, param.in_fov, effective_hfov, effective_vfov
             ));
         }
 
+        // 2x2 四象限排版：
+        // 左上: 前視 (front_q)
+        // 右上: 後視 (rear_q)
+        // 左下: 左視 (left_q)
+        // 右下: 右視 (right_q)
         filter_parts.push("[front_q][rear_q]hstack[top_row]".to_string());
         filter_parts.push("[left_q][right_q]hstack[bot_row]".to_string());
-        filter_parts.push("[top_row][bot_row]vstack,format=yuv420p[quad_out]".to_string());
+        filter_parts.push("[top_row][bot_row]vstack[quad_base]".to_string());
+
+        // 擷取原始後視畫面右上角之時間戳記 OSD，並精確疊加於整體輸出畫面右上角
+        let rear_quad_idx = config.mapping.iter().position(|m| m == "rear").unwrap_or(1);
+        let (ts_crop_x, ts_crop_y) = match rear_quad_idx {
+            0 => ("iw/2-370", "8"),
+            1 => ("iw-370", "8"),
+            2 => ("iw/2-370", "ih/2+8"),
+            _ => ("iw-370", "ih/2+8"),
+        };
+        filter_parts.push(format!(
+            "[0:v]crop=350:48:{ts_crop_x}:{ts_crop_y},format=yuva420p[ts_crop]"
+        ));
+        filter_parts.push(
+            "[quad_base][ts_crop]overlay=x=W-w-16:y=12,format=yuv420p[quad_out]".to_string()
+        );
 
         let filter_complex = filter_parts.join(";");
 
