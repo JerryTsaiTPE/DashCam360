@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod birdview;
 mod ffmpeg_worker;
 mod player;
 mod renderer3d;
@@ -59,8 +60,8 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DashCam360 Native - 汽車環景魚眼校正與 3D 空間投影系統 (Rust 高效原生版)")
-            .with_inner_size(Vec2::new(1380.0, 860.0))
-            .with_min_inner_size(Vec2::new(960.0, 600.0)),
+            .with_inner_size(Vec2::new(1440.0, 880.0))
+            .with_min_inner_size(Vec2::new(1024.0, 640.0)),
         ..Default::default()
     };
 

@@ -6,6 +6,7 @@ dist/
 *.dll
 *.pdb
 *.zip
+DashCam360_Rust_Portable/
 
 # Large media binaries
 **/ffmpeg.exe
@@ -17,6 +18,8 @@ output/
 *.mkv
 *.avi
 *.mov
+*.ts
+sample/
 _temp_frames/
 
 # Python cache

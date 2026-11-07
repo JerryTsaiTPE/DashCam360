@@ -7,17 +7,235 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use crossbeam_channel::Sender;
+use egui::Pos2;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+
+/// 單一鏡頭之廣角角度 (FOV)、縮放倍率、三軸角度修正 (Pitch/Yaw/Roll) 與 X/Y 軸平移控制
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CameraParam {
+    pub in_fov: i32,   // 輸入魚眼 FOV (120° ~ 230°，預設 180° / 195°)
+    pub zoom: f32,     // 縮放比例 (0.5x ~ 3.0x，預設 1.0x)
+    pub out_hfov: i32, // 展開水平 FOV (60° ~ 140°，預設 110° / 120°)
+    pub out_vfov: i32, // 展開垂直 FOV (50° ~ 120°，預設 80° / 85°)
+    pub pitch: i32,    // 俯仰角度 (-45° ~ +45°，負值朝下、正值朝上)
+    pub yaw: i32,      // 水平偏航 (-45° ~ +45°，負值偏左、正值偏右)
+    pub roll: i32,     // 滾轉傾斜 (-30° ~ +30°，水平旋轉調平)
+    pub offset_x: f32, // X 軸平移微調 (-1.00m ~ +1.00m，步進 0.01m，預設 0.00m)
+    pub offset_y: f32, // Y 軸平移微調 (-1.00m ~ +1.00m，步進 0.01m，預設 0.00m)
+}
+
+impl Default for CameraParam {
+    fn default() -> Self {
+        Self::default_for_cam(0)
+    }
+}
+
+#[allow(dead_code)]
+impl CameraParam {
+    /// 依據 CAM 專案標定參數校正後之最佳預設參數
+    /// 俯仰 (Pitch)、偏航 (Yaw)、滾轉 (Roll) 預設為 0° 微調偏量，代表 100% 套用 CAM 實車標定物理角度
+    pub fn default_for_cam(cam_idx: usize) -> Self {
+        match cam_idx {
+            0 => Self {
+                // 前視鏡頭 (TL): CAM 基準 pos=[0.11, 2.33, 0.82], yaw=4°, pitch=26.4°, roll=2.2°
+                in_fov: 185,
+                zoom: 1.00,
+                out_hfov: 110,
+                out_vfov: 80,
+                pitch: 0, // 微調偏量 (預設 0°)
+                yaw: 0,   // 微調偏量 (預設 0°)
+                roll: 0,  // 微調偏量 (預設 0°)
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
+            1 => Self {
+                // 後視鏡頭 (TR): CAM 基準 pos=[-0.04, -2.47, 0.75], yaw=180°, pitch=18.9°, roll=4.0°
+                in_fov: 185,
+                zoom: 1.00,
+                out_hfov: 110,
+                out_vfov: 80,
+                pitch: 0, // 微調偏量 (預設 0°)
+                yaw: 0,   // 微調偏量 (預設 0°)
+                roll: 0,  // 微調偏量 (預設 0°)
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
+            2 => Self {
+                // 左側鏡頭 (BL): CAM 基準 pos=[-1.03, 0.55, 1.02], yaw=-90°, pitch=85.0°, roll=-7.6°
+                in_fov: 195,
+                zoom: 1.00,
+                out_hfov: 120,
+                out_vfov: 85,
+                pitch: 0, // 微調偏量 (預設 0°)
+                yaw: 0,   // 微調偏量 (預設 0°)
+                roll: 0,  // 微調偏量 (預設 0°)
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
+            _ => Self {
+                // 右側鏡頭 (BR): CAM 基準 pos=[0.93, 0.55, 1.02], yaw=90°, pitch=83.1°, roll=2.2°
+                in_fov: 195,
+                zoom: 1.00,
+                out_hfov: 120,
+                out_vfov: 85,
+                pitch: 0, // 微調偏量 (預設 0°)
+                yaw: 0,   // 微調偏量 (預設 0°)
+                roll: 0,  // 微調偏量 (預設 0°)
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
+        }
+    }
+
+    /// 取得前後左右 4 路鏡頭之完整預設校正參數組
+    pub fn default_presets() -> [Self; 4] {
+        [
+            Self::default_for_cam(0),
+            Self::default_for_cam(1),
+            Self::default_for_cam(2),
+            Self::default_for_cam(3),
+        ]
+    }
+
+    /// 【第一階段 Stage 1：魚眼鏡頭物理去畸變模型 (Fisheye Radial Barrel Undistortion)】
+    /// 將去畸變後的理想針孔透視平面座標 `(xu, yu)` (以鏡頭真實光心 `(u0, v0)` 為原點)
+    /// 逆向映射回原始魚眼感測器 UV 座標 `(u, v)`：
+    /// `r^2 = xu^2 + yu^2`, `D(r^2) = 1 / sqrt(1 + k1 * r^2 + k2 * r^4)`
+    #[inline]
+    pub fn undistort_pinhole_to_fisheye(
+        xu: f32,
+        yu: f32,
+        u0: f32,
+        v0: f32,
+        k1: f32,
+        k2: f32,
+    ) -> Pos2 {
+        let r2 = xu * xu + yu * yu;
+        let d = 1.0_f32 / (1.0_f32 + k1 * r2 + k2 * r2 * r2).max(0.05_f32).sqrt();
+        Pos2::new(u0 + xu * d, v0 + yu * d)
+    }
+
+    /// 在鳥瞰圖已經過實車地面透視與魚眼拉直的基準 UV 上，疊加使用者的即時微調增量 (0ms 即時預覽)
+    /// 當參數處於預設值時，100% 保持最佳無縫拼接與筆直雙白線；當拖動滑桿時即時反應縮放與三軸旋轉
+    pub fn apply_birdview_delta(&self, cam_idx: usize, base_uv: Pos2, pivot: Pos2) -> Pos2 {
+        let def = Self::default_for_cam(cam_idx);
+
+        let safe_in_fov = (self.in_fov as f32).clamp(100.0, 250.0);
+        let def_in_fov = (def.in_fov as f32).clamp(100.0, 250.0);
+        let safe_zoom = self.zoom.clamp(0.3, 4.0);
+
+        let rel_mag = (safe_zoom / def.zoom) * (def_in_fov / safe_in_fov);
+        let scale_x = (self.out_hfov as f32 / def.out_hfov as f32) / rel_mag;
+        let scale_y = (self.out_vfov as f32 / def.out_vfov as f32) / rel_mag;
+
+        let mut dx = (base_uv.x - pivot.x) * scale_x;
+        let mut dy = (base_uv.y - pivot.y) * scale_y;
+
+        let d_pitch = ((self.pitch - def.pitch) as f32).to_radians();
+        let d_yaw = ((self.yaw - def.yaw) as f32).to_radians();
+        let d_roll = ((self.roll - def.roll) as f32).to_radians();
+
+        // 俯仰與偏航微調位移
+        dy -= d_pitch.sin() * 0.45_f32;
+        dx += d_yaw.sin() * 0.45_f32;
+
+        // 俯仰梯形透視微調
+        let keystone = (1.0_f32 + dy * d_pitch.sin() * 0.6_f32).clamp(0.5_f32, 2.0_f32);
+        dx *= keystone;
+
+        // 滾轉 (Roll) 旋轉
+        let cos_r = d_roll.cos();
+        let sin_r = d_roll.sin();
+        let rot_x = dx * cos_r - dy * sin_r;
+        let rot_y = dx * sin_r + dy * cos_r;
+
+        Pos2::new(
+            (rot_x + pivot.x).clamp(0.002, 0.998),
+            (rot_y + pivot.y).clamp(0.002, 0.998),
+        )
+    }
+
+    /// 根據當前廣角、縮放與三軸角度修正，將原始 UV 進行即時投影轉換 (供中央單路主畫面 0ms 即時預覽)
+    /// - 左側視角 (cam_idx == 2): 自動逆時針旋轉 -90° (讓車頭朝上、車尾朝下、左側車道在左)
+    /// - 右側視角 (cam_idx == 3): 自動順時針旋轉 +90° (讓車頭朝上、車尾朝下、右側車道在右)
+    /// - 前後視角 (cam_idx == 0, 1): 寬廣自然透視展開，完整保留左右雙白線與前方車道
+    pub fn transform_uv_for_cam(&self, cam_idx: usize, raw_uv: Pos2) -> Pos2 {
+        let def = Self::default_for_cam(cam_idx);
+        let safe_in_fov = (self.in_fov as f32).clamp(100.0, 250.0);
+        let def_in_fov = (def.in_fov as f32).clamp(100.0, 250.0);
+        let safe_zoom = self.zoom.clamp(0.3, 4.0);
+
+        let rel_mag = (safe_zoom / def.zoom) * (def_in_fov / safe_in_fov);
+        let fov_scale_x = (self.out_hfov as f32 / def.out_hfov as f32) / rel_mag;
+        let fov_scale_y = (self.out_vfov as f32 / def.out_vfov as f32) / rel_mag;
+
+        let mut nx = (raw_uv.x - 0.5_f32) * 2.0_f32;
+        let mut ny = (raw_uv.y - 0.5_f32) * 2.0_f32;
+
+        // 輕度魚眼桶狀反畸變 (將彎曲車道線拉直，同時保留寬廣車道視野)
+        let r2 = nx * nx + ny * ny;
+        let dewarp = 1.0_f32 - 0.08_f32 * r2;
+        nx *= dewarp * fov_scale_x;
+        ny *= dewarp * fov_scale_y;
+
+        // 增量俯仰/偏航/滾轉 (預設值時保持最自然寬廣的標準車道構圖)
+        let d_pitch = ((self.pitch - def.pitch) as f32).to_radians();
+        let d_yaw = ((self.yaw - def.yaw) as f32).to_radians();
+        let d_roll = ((self.roll - def.roll) as f32).to_radians();
+
+        ny -= d_pitch.sin() * 0.65_f32;
+        nx += d_yaw.sin() * 0.65_f32;
+
+        let keystone = (1.0_f32 + ny * d_pitch.sin() * 0.45_f32).clamp(0.5_f32, 2.0_f32);
+        nx *= keystone;
+
+        let cos_r = d_roll.cos();
+        let sin_r = d_roll.sin();
+        let rx = nx * cos_r - ny * sin_r + self.offset_x * 0.40_f32;
+        let ry = nx * sin_r + ny * cos_r - self.offset_y * 0.40_f32;
+
+        let (u, v) = match cam_idx {
+            0 => {
+                // 前視鏡頭 (TL): 寬廣展開，完整呈現前方車道與左右雙白線
+                (0.50_f32 + rx * 0.43_f32, 0.50_f32 + ry * 0.42_f32)
+            }
+            1 => {
+                // 後視鏡頭 (TR): 寬廣展開，完整呈現後方車道與左右雙白線
+                (0.525_f32 + rx * 0.43_f32, 0.50_f32 + ry * 0.42_f32)
+            }
+            2 => {
+                // 左側鏡頭 (BL): 轉 -90 度 (逆時針 90 度)
+                // 螢幕上方 (ry = -1) 對應車頭 (u 較大)，螢幕下方 (ry = +1) 對應車尾 (u 較小)
+                // 螢幕左方 (rx = -1) 對應左側外車道 (v 較小)，螢幕右方 (rx = +1) 對應車身側 (v 較大)
+                let u_rot = 0.48_f32 - ry * 0.42_f32;
+                let v_rot = 0.46_f32 + rx * 0.42_f32;
+                (u_rot, v_rot)
+            }
+            _ => {
+                // 右側鏡頭 (BR): 轉 +90 度 (順時針 90 度)
+                // 螢幕上方 (ry = -1) 對應車頭 (u 較小)，螢幕下方 (ry = +1) 對應車尾 (u 較大)
+                // 螢幕左方 (rx = -1) 對應車身側 (v 較大)，螢幕右方 (rx = +1) 對應右側外車道 (v 較小)
+                let u_rot = 0.51_f32 + ry * 0.42_f32;
+                let v_rot = 0.46_f32 - rx * 0.42_f32;
+                (u_rot, v_rot)
+            }
+        };
+
+        Pos2::new(u.clamp(0.002, 0.998), v.clamp(0.002, 0.998))
+    }
+
+    pub fn transform_uv(&self, raw_uv: Pos2) -> Pos2 {
+        self.transform_uv_for_cam(0, raw_uv)
+    }
+}
 
 pub struct ProcessConfig {
     pub input_path: PathBuf,
     pub output_dir: PathBuf,
     pub mapping: [String; 4], // [TL, TR, BL, BR] -> roles e.g. "front", "rear", "left", "right"
-    pub in_fov: i32,
-    pub out_hfov: i32,
-    pub out_vfov: i32,
+    pub camera_params: [CameraParam; 4], // 0: front, 1: rear, 2: left, 3: right
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +263,81 @@ pub fn get_executable(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// 透過 ffprobe (或備援 ffmpeg -i) 偵測影片真實秒數
+pub fn probe_video_duration(path: &Path) -> Option<f32> {
+    if !path.exists() {
+        return None;
+    }
+
+    // 1. 優先使用 ffprobe 讀取 format=duration 與 stream=duration
+    let ffprobe_bin = get_executable("ffprobe");
+    for entry in ["format=duration", "stream=duration"] {
+        let mut cmd = Command::new(&ffprobe_bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+        cmd.args([
+            "-v",
+            "error",
+            "-show_entries",
+            entry,
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+        if let Ok(output) = cmd.output() {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                for line in s.lines() {
+                    if let Ok(dur) = line.trim().parse::<f32>() {
+                        if dur > 0.05 && dur.is_finite() {
+                            return Some(dur);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 備援：若無 ffprobe，使用 ffmpeg -i 從 stderr 解析 "Duration: HH:MM:SS.xx"
+    let ffmpeg_bin = get_executable("ffmpeg");
+    let mut cmd_ff = Command::new(&ffmpeg_bin);
+    #[cfg(windows)]
+    cmd_ff.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    cmd_ff
+        .arg("-i")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    if let Ok(output) = cmd_ff.output() {
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        if let Some(idx) = stderr_str.find("Duration:") {
+            let rest = &stderr_str[idx + "Duration:".len()..].trim_start();
+            let time_part = rest.split(',').next().unwrap_or("").trim();
+            let parts: Vec<&str> = time_part.split(':').collect();
+            if parts.len() == 3 {
+                if let (Ok(h), Ok(m), Ok(s)) = (
+                    parts[0].trim().parse::<f32>(),
+                    parts[1].trim().parse::<f32>(),
+                    parts[2].trim().parse::<f32>(),
+                ) {
+                    let total = h * 3600.0 + m * 60.0 + s;
+                    if total > 0.05 && total.is_finite() {
+                        return Some(total);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub fn start_processing(
     config: ProcessConfig,
     cancel_flag: Arc<AtomicBool>,
@@ -53,6 +346,9 @@ pub fn start_processing(
     std::thread::spawn(move || {
         let ffmpeg_bin = get_executable("ffmpeg");
         let _ = std::fs::create_dir_all(&config.output_dir);
+
+        // 先偵測輸入影片實際長度，避免進度條固定除以 5 秒
+        let total_duration = probe_video_duration(&config.input_path).unwrap_or(5.0).max(0.1);
 
         let front_out = config.output_dir.join("front.mp4");
         let rear_out = config.output_dir.join("rear.mp4");
@@ -73,9 +369,36 @@ pub fn start_processing(
         for i in 0..4 {
             let crop = quad_crops[i];
             let role = &config.mapping[i];
+            let param = match role.as_str() {
+                "front" => &config.camera_params[0],
+                "rear" => &config.camera_params[1],
+                "left" => &config.camera_params[2],
+                "right" => &config.camera_params[3],
+                _ => &config.camera_params[0],
+            };
+
+            let mut rot_args = String::new();
+            if param.pitch != 0 {
+                rot_args.push_str(&format!(":pitch={}", param.pitch));
+            }
+            if param.yaw != 0 {
+                rot_args.push_str(&format!(":yaw={}", param.yaw));
+            }
+
+            // 物理安裝方向旋轉 (左側 -90°，右側 +90°) 疊加使用者的微調偏量 param.roll
+            let effective_roll = match role.as_str() {
+                "left" => -90 + param.roll,
+                "right" => 90 + param.roll,
+                _ => param.roll,
+            };
+            if effective_roll != 0 {
+                rot_args.push_str(&format!(":roll={}", effective_roll));
+            }
+
+            // 指定 w=960:h=540，確保所有 4 路輸出的幾何尺寸完全嚴格一致，防止 vstack 產生寬度不合之 error -22
             filter_parts.push(format!(
-                "[0:v]{crop},v360=input=fisheye:output=rectilinear:ih_fov={}:iv_fov={}:h_fov={}:v_fov={},format=yuv420p,split=2[{role}][{role}_q]",
-                config.in_fov, config.in_fov, config.out_hfov, config.out_vfov
+                "[0:v]{crop},v360=input=fisheye:output=rectilinear:ih_fov={}:iv_fov={}:h_fov={}:v_fov={}{rot_args}:w=960:h=540,format=yuv420p,split=2[{role}][{role}_q]",
+                param.in_fov, param.in_fov, param.out_hfov, param.out_vfov
             ));
         }
 
@@ -85,7 +408,10 @@ pub fn start_processing(
 
         let filter_complex = filter_parts.join(";");
 
-        let _ = tx.send(WorkerMessage::Progress(2.0, "啟動 FFmpeg 並行裁切與 v360 魚眼展開拉直...".to_string()));
+        let _ = tx.send(WorkerMessage::Progress(
+            2.0,
+            format!("啟動 FFmpeg 並行裁切與 v360 魚眼展開拉直 (影片長度: {:.1}s)...", total_duration),
+        ));
 
         let mut cmd = Command::new(&ffmpeg_bin);
         #[cfg(windows)]
@@ -109,7 +435,7 @@ pub fn start_processing(
             .arg("-progress")
             .arg("pipe:1")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -118,6 +444,21 @@ pub fn start_processing(
                 return;
             }
         };
+
+        let stderr_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let stderr_lines_clone = stderr_lines.clone();
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let mut lock = stderr_lines_clone.lock().unwrap();
+                    if lock.len() >= 12 {
+                        lock.remove(0);
+                    }
+                    lock.push(line);
+                }
+            });
+        }
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
@@ -135,8 +476,11 @@ pub fn start_processing(
                 } else if line.starts_with("out_time_us=") {
                     if let Ok(us) = line.trim_start_matches("out_time_us=").trim().parse::<u64>() {
                         let sec = us as f32 / 1_000_000.0;
-                        let pct = (sec / 5.0 * 100.0).clamp(5.0, 98.0);
-                        let _ = tx.send(WorkerMessage::Progress(pct, format!("處理中: {:.1}% ({:.1}s, @{}fps)", pct, sec, curr_fps)));
+                        let pct = (sec / total_duration * 100.0).clamp(2.0, 99.0);
+                        let _ = tx.send(WorkerMessage::Progress(
+                            pct,
+                            format!("處理中: {:.1}% ({:.1}s / {:.1}s, @{}fps)", pct, sec, total_duration, curr_fps),
+                        ));
                     }
                 }
             }
@@ -148,7 +492,8 @@ pub fn start_processing(
                 let _ = tx.send(WorkerMessage::Complete(front_out, rear_out, left_out, right_out));
             }
             Ok(status) => {
-                let _ = tx.send(WorkerMessage::Error(format!("FFmpeg 執行結束但代碼異常: {:?}", status.code())));
+                let err_detail = stderr_lines.lock().unwrap().join("\n");
+                let _ = tx.send(WorkerMessage::Error(format!("FFmpeg 執行結束但代碼異常: {:?}\n{}", status.code(), err_detail)));
             }
             Err(e) => {
                 let _ = tx.send(WorkerMessage::Error(format!("等待 FFmpeg 錯誤: {}", e)));
@@ -162,6 +507,34 @@ pub fn generate_demo_sample(out_path: &Path, tx: Sender<WorkerMessage>) {
     std::thread::spawn(move || {
         let ffmpeg_bin = get_executable("ffmpeg");
         let _ = std::fs::create_dir_all(out_file.parent().unwrap_or(Path::new(".")));
+
+        let real_jpg = out_file
+            .parent()
+            .unwrap_or(Path::new("sample_videos"))
+            .join("real_quad_frame.jpg");
+
+        if real_jpg.exists() {
+            let _ = tx.send(WorkerMessage::Progress(15.0, "正在載入實車四路魚眼道路樣品...".to_string()));
+            let mut cmd = Command::new(&ffmpeg_bin);
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000);
+
+            cmd.arg("-y")
+                .args(["-loop", "1", "-i"])
+                .arg(&real_jpg)
+                .args([
+                    "-c:v", "libx264", "-preset", "veryfast", "-t", "6", "-r", "25",
+                    "-pix_fmt", "yuv420p", "-vf", "scale=1920:1080", "-movflags", "+faststart",
+                ])
+                .arg(&out_file);
+
+            if let Ok(output) = cmd.output() {
+                if output.status.success() {
+                    let _ = tx.send(WorkerMessage::Progress(100.0, "實車四路魚眼樣品載入完成！".to_string()));
+                    return;
+                }
+            }
+        }
 
         let _ = tx.send(WorkerMessage::Progress(10.0, "正在生成合成測試影片...".to_string()));
 
