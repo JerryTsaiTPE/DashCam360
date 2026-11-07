@@ -338,6 +338,41 @@ pub fn probe_video_duration(path: &Path) -> Option<f32> {
     None
 }
 
+/// 為單一鏡頭產生指定輸出解析度 (out_w, out_h) 的 16-bit 像素重映射表 (gray16le)
+/// rawvideo 格式：每像素 2 bytes (little-endian u16)，值為原象限裁切影像 (960x540) 中的 X 與 Y 坐標
+fn generate_remap_tables(
+    xmap_path: &Path,
+    ymap_path: &Path,
+    out_w: u32,
+    out_h: u32,
+    src_w: f32, // 960.0
+    src_h: f32, // 540.0
+    param: &CameraParam,
+    cam_idx: usize,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut bx = std::io::BufWriter::new(std::fs::File::create(xmap_path)?);
+    let mut by = std::io::BufWriter::new(std::fs::File::create(ymap_path)?);
+
+    let max_x = (src_w - 1.0).max(0.0);
+    let max_y = (src_h - 1.0).max(0.0);
+
+    for y in 0..out_h {
+        let raw_y = (y as f32 + 0.5) / (out_h as f32);
+        for x in 0..out_w {
+            let raw_x = (x as f32 + 0.5) / (out_w as f32);
+            let src_uv = param.transform_uv_for_cam(cam_idx, Pos2::new(raw_x, raw_y));
+            let sx = (src_uv.x * src_w).clamp(0.0, max_x).round() as u16;
+            let sy = (src_uv.y * src_h).clamp(0.0, max_y).round() as u16;
+            bx.write_all(&sx.to_le_bytes())?;
+            by.write_all(&sy.to_le_bytes())?;
+        }
+    }
+    bx.flush()?;
+    by.flush()?;
+    Ok(())
+}
+
 pub fn start_processing(
     config: ProcessConfig,
     cancel_flag: Arc<AtomicBool>,
@@ -356,6 +391,45 @@ pub fn start_processing(
         let right_out = config.output_dir.join("right.mp4");
         let quad_out = config.output_dir.join("quad_rectified.mp4");
 
+        // 建立儲存 remap 映射表的暫存目錄
+        let temp_map_dir = std::env::temp_dir().join(format!(
+            "dashcam360_remap_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&temp_map_dir);
+
+        let roles = ["front", "rear", "left", "right"];
+
+        // 1. 生成 4 路單路輸出 (960x540) 的 remap 表
+        let mut single_map_files = Vec::new();
+        for (idx, role) in roles.iter().enumerate() {
+            let xmap = temp_map_dir.join(format!("xmap_{}_single.raw", role));
+            let ymap = temp_map_dir.join(format!("ymap_{}_single.raw", role));
+            if let Err(e) = generate_remap_tables(&xmap, &ymap, 960, 540, 960.0, 540.0, &config.camera_params[idx], idx) {
+                let _ = tx.send(WorkerMessage::Error(format!("無法生成單路 {} remap 坐標表: {}", role, e)));
+                let _ = std::fs::remove_dir_all(&temp_map_dir);
+                return;
+            }
+            single_map_files.push((xmap, ymap));
+        }
+
+        // 2. 生成 4 路四象限拼版輸出 (960x510，配合頂欄 60px 組成標準 1920x1080) 的 remap 表
+        let mut quad_map_files = Vec::new();
+        for (idx, role) in roles.iter().enumerate() {
+            let xmap = temp_map_dir.join(format!("xmap_{}_quad.raw", role));
+            let ymap = temp_map_dir.join(format!("ymap_{}_quad.raw", role));
+            if let Err(e) = generate_remap_tables(&xmap, &ymap, 960, 510, 960.0, 540.0, &config.camera_params[idx], idx) {
+                let _ = tx.send(WorkerMessage::Error(format!("無法生成四象限 {} remap 坐標表: {}", role, e)));
+                let _ = std::fs::remove_dir_all(&temp_map_dir);
+                return;
+            }
+            quad_map_files.push((xmap, ymap));
+        }
+
         // 象限裁切
         let quad_crops = [
             "crop=iw/2:ih/2:0:0",
@@ -366,48 +440,28 @@ pub fn start_processing(
 
         let mut filter_parts = Vec::new();
 
+        // 裁切原影片各象限並分流 (split=2) 給單路 remap 與拼版 remap
         for i in 0..4 {
             let crop = quad_crops[i];
             let role = &config.mapping[i];
-            let param = match role.as_str() {
-                "front" => &config.camera_params[0],
-                "rear" => &config.camera_params[1],
-                "left" => &config.camera_params[2],
-                "right" => &config.camera_params[3],
-                _ => &config.camera_params[0],
-            };
+            filter_parts.push(format!("[0:v]{crop},split=2[{role}_raw_s][{role}_raw_q]"));
+        }
 
-            // 疊加 X/Y 平移微調到角度偏量 (每 10cm 平移對應約 1.2° 角度位移)
-            let pitch_val = param.pitch as f32 - param.offset_y * 12.0;
-            let yaw_val = param.yaw as f32 + param.offset_x * 12.0;
-
-            let mut rot_args = String::new();
-            if pitch_val.abs() > 0.05 {
-                rot_args.push_str(&format!(":pitch={:.2}", pitch_val));
-            }
-            if yaw_val.abs() > 0.05 {
-                rot_args.push_str(&format!(":yaw={:.2}", yaw_val));
-            }
-
-            // 物理安裝方向旋轉 (左側 -90°，右側 +90°) 疊加使用者的微調偏量 param.roll
-            let effective_roll = match role.as_str() {
-                "left" => -90.0 + param.roll as f32,
-                "right" => 90.0 + param.roll as f32,
-                _ => param.roll as f32,
-            };
-            if effective_roll.abs() > 0.05 {
-                rot_args.push_str(&format!(":roll={:.2}", effective_roll));
-            }
-
-            // 根據使用者在 UI 上拖動的 Zoom 縮放倍率，動態調節展開 FOV (達成光學無損 Zoom)
-            let safe_zoom = param.zoom.clamp(0.4, 3.0);
-            let effective_hfov = ((param.out_hfov as f32 / safe_zoom).clamp(25.0, 160.0)) as i32;
-            let effective_vfov = ((param.out_vfov as f32 / safe_zoom).clamp(25.0, 140.0)) as i32;
-
-            // 指定 w=960:h=540，確保所有 4 路輸出的幾何尺寸完全嚴格一致，防止 vstack 產生寬度不合之 error -22
+        // 單路 remap (輸入 1~8)
+        for (idx, role) in roles.iter().enumerate() {
+            let in_x = 1 + idx * 2;
+            let in_y = 2 + idx * 2;
             filter_parts.push(format!(
-                "[0:v]{crop},v360=input=fisheye:output=rectilinear:ih_fov={}:iv_fov={}:h_fov={}:v_fov={}{rot_args}:w=960:h=540,format=yuv420p,split=2[{role}][{role}_q]",
-                param.in_fov, param.in_fov, effective_hfov, effective_vfov
+                "[{role}_raw_s][{in_x}:v][{in_y}:v]remap,format=yuv420p[{role}]"
+            ));
+        }
+
+        // 四象限 remap (輸入 9~16)
+        for (idx, role) in roles.iter().enumerate() {
+            let in_x = 9 + idx * 2;
+            let in_y = 10 + idx * 2;
+            filter_parts.push(format!(
+                "[{role}_raw_q][{in_x}:v][{in_y}:v]remap,format=yuv420p[{role}_q]"
             ));
         }
 
@@ -416,30 +470,32 @@ pub fn start_processing(
         // 右上: 後視 (rear_q)
         // 左下: 左視 (left_q)
         // 右下: 右視 (right_q)
+        // 四畫面各 960x510，hstack + vstack 為 1920x1020
+        // 透過 pad 於上方補 60px 純黑資訊列，達成精準標準 1920x1080 且完全同步長度
         filter_parts.push("[front_q][rear_q]hstack[top_row]".to_string());
         filter_parts.push("[left_q][right_q]hstack[bot_row]".to_string());
-        filter_parts.push("[top_row][bot_row]vstack[quad_base]".to_string());
+        filter_parts.push("[top_row][bot_row]vstack,pad=1920:1080:0:60:black[canvas]".to_string());
 
-        // 擷取原始後視畫面右上角之時間戳記 OSD，並精確疊加於整體輸出畫面右上角
+        // 擷取原始後視畫面右上角之時間戳記 (完整保留頭尾字元 440x56)，精確疊加於最右上角黑色頂欄，0% 遮擋畫面
         let rear_quad_idx = config.mapping.iter().position(|m| m == "rear").unwrap_or(1);
         let (ts_crop_x, ts_crop_y) = match rear_quad_idx {
-            0 => ("iw/2-370", "8"),
-            1 => ("iw-370", "8"),
-            2 => ("iw/2-370", "ih/2+8"),
-            _ => ("iw-370", "ih/2+8"),
+            0 => ("iw/2-445", "0"),
+            1 => ("iw-445", "0"),
+            2 => ("iw/2-445", "ih/2"),
+            _ => ("iw-445", "ih/2"),
         };
         filter_parts.push(format!(
-            "[0:v]crop=350:48:{ts_crop_x}:{ts_crop_y},format=yuva420p[ts_crop]"
+            "[0:v]crop=440:56:{ts_crop_x}:{ts_crop_y},format=yuva420p[ts_crop]"
         ));
         filter_parts.push(
-            "[quad_base][ts_crop]overlay=x=W-w-16:y=12,format=yuv420p[quad_out]".to_string()
+            "[canvas][ts_crop]overlay=x=W-w-16:y=2:shortest=1,format=yuv420p[quad_out]".to_string()
         );
 
         let filter_complex = filter_parts.join(";");
 
         let _ = tx.send(WorkerMessage::Progress(
             2.0,
-            format!("啟動 FFmpeg 並行裁切與 v360 魚眼展開拉直 (影片長度: {:.1}s)...", total_duration),
+            format!("啟動 FFmpeg 像素級精準 remap 轉檔 (影片長度: {:.1}s)...", total_duration),
         ));
 
         let mut cmd = Command::new(&ffmpeg_bin);
@@ -448,18 +504,35 @@ pub fn start_processing(
 
         cmd.arg("-y")
             .arg("-i")
-            .arg(&config.input_path)
-            .arg("-filter_complex")
+            .arg(&config.input_path);
+
+        // 加入單路 960x540 remap 表輸入 (循環對齊輸入影片長度)
+        for (xmap, ymap) in &single_map_files {
+            cmd.args(["-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gray16le", "-video_size", "960x540", "-i"])
+                .arg(xmap)
+                .args(["-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gray16le", "-video_size", "960x540", "-i"])
+                .arg(ymap);
+        }
+
+        // 加入四象限 960x510 remap 表輸入 (循環對齊輸入影片長度)
+        for (xmap, ymap) in &quad_map_files {
+            cmd.args(["-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gray16le", "-video_size", "960x510", "-i"])
+                .arg(xmap)
+                .args(["-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gray16le", "-video_size", "960x510", "-i"])
+                .arg(ymap);
+        }
+
+        cmd.arg("-filter_complex")
             .arg(&filter_complex)
-            .args(["-map", "[front]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-map", "[front]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart"])
             .arg(&front_out)
-            .args(["-map", "[rear]",  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-map", "[rear]",  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart"])
             .arg(&rear_out)
-            .args(["-map", "[left]",  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-map", "[left]",  "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart"])
             .arg(&left_out)
-            .args(["-map", "[right]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-map", "[right]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart"])
             .arg(&right_out)
-            .args(["-map", "[quad_out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            .args(["-map", "[quad_out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-shortest", "-movflags", "+faststart"])
             .arg(&quad_out)
             .arg("-progress")
             .arg("pipe:1")
@@ -470,6 +543,7 @@ pub fn start_processing(
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(WorkerMessage::Error(format!("無法啟動 FFmpeg ({}): {}", ffmpeg_bin.display(), e)));
+                let _ = std::fs::remove_dir_all(&temp_map_dir);
                 return;
             }
         };
@@ -496,6 +570,7 @@ pub fn start_processing(
             for line in reader.lines().flatten() {
                 if cancel_flag.load(Ordering::SeqCst) {
                     let _ = child.kill();
+                    let _ = std::fs::remove_dir_all(&temp_map_dir);
                     let _ = tx.send(WorkerMessage::Progress(0.0, "已取消處理".to_string()));
                     return;
                 }
@@ -515,9 +590,12 @@ pub fn start_processing(
             }
         }
 
-        match child.wait() {
+        let wait_res = child.wait();
+        let _ = std::fs::remove_dir_all(&temp_map_dir);
+
+        match wait_res {
             Ok(status) if status.success() => {
-                let _ = tx.send(WorkerMessage::Progress(100.0, "v360 魚眼校正與 4 路分離完成！".to_string()));
+                let _ = tx.send(WorkerMessage::Progress(100.0, "像素級一致校正與 4 路分離固化完成！".to_string()));
                 let _ = tx.send(WorkerMessage::Complete(front_out, rear_out, left_out, right_out));
             }
             Ok(status) => {
