@@ -15,8 +15,8 @@ use crate::ffmpeg_worker::{get_executable, probe_video_duration};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const FRAME_W: usize = 640;
-const FRAME_H: usize = 360;
+pub const FRAME_W: usize = 640;
+pub const FRAME_H: usize = 360;
 const FRAME_BYTES: usize = FRAME_W * FRAME_H * 4; // RGBA
 const PLAYBACK_FPS: f32 = 25.0;
 
@@ -40,6 +40,8 @@ pub struct QuadPlayer {
     pub rx_frames: Receiver<FrameData>,
     tx_frames: Sender<FrameData>,
     pub textures: [Option<TextureHandle>; 4],
+    pub latest_frames: [Option<Vec<u8>>; 4],
+    pub frame_gen: u64,
     pub loaded_paths: Option<[PathBuf; 4]>,
     pub current_source: Option<PlayerSource>,
     pub current_time_sec: f32,
@@ -58,6 +60,8 @@ impl QuadPlayer {
             rx_frames: rx,
             tx_frames: tx,
             textures: [None, None, None, None],
+            latest_frames: [None, None, None, None],
+            frame_gen: 0,
             loaded_paths: None,
             current_source: None,
             current_time_sec: 0.0,
@@ -372,6 +376,9 @@ impl QuadPlayer {
                 );
                 self.textures[frame.role_idx] = Some(tex);
             }
+
+            self.latest_frames[frame.role_idx] = Some(frame.pixels);
+            self.frame_gen = self.frame_gen.wrapping_add(1);
         }
 
         if self.is_playing && (!self.is_paused || received_any) {

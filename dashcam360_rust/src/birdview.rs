@@ -9,6 +9,7 @@
 
 use egui::{Color32, Mesh, Painter, Pos2, Rect, Stroke, TextureHandle, TextureId, Vec2};
 use crate::ffmpeg_worker::CameraParam;
+use crate::player::{FRAME_H, FRAME_W};
 
 pub const CAR_TOPVIEW_BYTES: &[u8] = include_bytes!("../car_topview.png");
 
@@ -171,8 +172,20 @@ impl CamCalib {
         x_w: f32,
         y_w: f32,
     ) -> Option<(Pos2, f32)> {
+        self.project_and_weight_z(axes, x_w, y_w, 0.0)
+    }
+
+    /// 將 3D 碗狀地面點 (X, Y, Z) 投影至本鏡頭之歸一化 UV 坐標與計算物理融合權重
+    #[inline]
+    pub fn project_and_weight_z(
+        &self,
+        axes: &([f32; 3], [f32; 3], [f32; 3]),
+        x_w: f32,
+        y_w: f32,
+        z_w: f32,
+    ) -> Option<(Pos2, f32)> {
         let (xa, ya, za) = axes;
-        let d = [x_w - self.pos[0], y_w - self.pos[1], -self.pos[2]];
+        let d = [x_w - self.pos[0], y_w - self.pos[1], z_w - self.pos[2]];
         let xc = d[0] * xa[0] + d[1] * xa[1] + d[2] * xa[2];
         let yc = d[0] * ya[0] + d[1] * ya[1] + d[2] * ya[2];
         let zc = d[0] * za[0] + d[1] * za[1] + d[2] * za[2];
@@ -207,17 +220,481 @@ impl CamCalib {
         }
 
         // 3D 車身 AABB 遮蔽檢測 (排除自身車門與保險桿反光)
-        if hit_ego_boxes(&self.pos, &[x_w, y_w, 0.0]) {
+        if hit_ego_boxes(&self.pos, &[x_w, y_w, z_w]) {
             return None;
         }
 
         // CAM 專案之 GSD 地面密度權重 (p = 3.0) 與邊緣漸變羽化
-        let dens = (self.pos[2] / n).clamp(0.0, 1.0).powi(3);
+        let dz = (self.pos[2] - z_w).abs().max(0.05);
+        let dens = (dz / n).clamp(0.0, 1.0).powi(3);
         let fade = ((self.r_max - r) / 45.0).clamp(0.0, 1.0);
         let w = dens * fade * self.gain;
 
         Some((Pos2::new(u_px / 960.0, v_px / 540.0), w))
     }
+}
+
+/// 計算 3D 碗狀曲面地面高度 Z(x, y)：
+/// 車身周圍近場維持平坦 (Z = 0.0) 確保停車線/車道線筆直，遠處平滑向上彎曲減少放射狀拉伸。
+#[inline]
+pub fn bowl_height(x_w: f32, y_w: f32, bowl_strength: f32) -> f32 {
+    if bowl_strength <= 0.001 {
+        return 0.0;
+    }
+    let dx = (x_w.abs() - 1.8).max(0.0);
+    let dy = (y_w.abs() - 3.6).max(0.0);
+    let d_excess = (dx * dx + dy * dy).sqrt();
+    (bowl_strength * 0.07 * d_excess * d_excess).min(0.9)
+}
+
+/// 雙線性採樣 RGBA 影像像素 (回傳歸一化 [R, G, B] 於 0.0..=1.0)
+#[inline]
+fn sample_rgb_bilinear(pixels: &[u8], w: usize, h: usize, uv: Pos2) -> Option<[f32; 3]> {
+    if pixels.len() < w * h * 4 || w < 2 || h < 2 {
+        return None;
+    }
+    let fx = uv.x.clamp(0.0, 1.0) * (w - 1) as f32;
+    let fy = uv.y.clamp(0.0, 1.0) * (h - 1) as f32;
+    let x0 = (fx.floor() as usize).min(w - 2);
+    let y0 = (fy.floor() as usize).min(h - 2);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+
+    let idx00 = (y0 * w + x0) * 4;
+    let idx10 = idx00 + 4;
+    let idx01 = ((y0 + 1) * w + x0) * 4;
+    let idx11 = idx01 + 4;
+
+    let mut out = [0.0_f32; 3];
+    for c in 0..3 {
+        let v00 = pixels[idx00 + c] as f32;
+        let v10 = pixels[idx10 + c] as f32;
+        let v01 = pixels[idx01 + c] as f32;
+        let v11 = pixels[idx11 + c] as f32;
+        let v0 = v00 + (v10 - v00) * tx;
+        let v1 = v01 + (v11 - v01) * tx;
+        out[c] = (v0 + (v1 - v0) * ty) / 255.0;
+    }
+    Some(out)
+}
+
+/// 建構 4 路 CamCalib 實例與正交軸
+fn build_cams_and_axes(params: &[CameraParam; 4]) -> ([CamCalib; 4], [([f32; 3], [f32; 3], [f32; 3]); 4]) {
+    let mut cams = [
+        CamCalib::default_for_cam(0),
+        CamCalib::default_for_cam(1),
+        CamCalib::default_for_cam(2),
+        CamCalib::default_for_cam(3),
+    ];
+    for i in 0..4 {
+        cams[i].apply_param(i, &params[i]);
+    }
+    let axes = [cams[0].axes(), cams[1].axes(), cams[2].axes(), cams[3].axes()];
+    (cams, axes)
+}
+
+/// 一鍵自動對齊結果報告
+#[derive(Clone, Copy, Debug)]
+pub struct AutoAlignReport {
+    pub before_rmse: f32,
+    pub after_rmse: f32,
+    pub improved_pct: f32,
+    pub overlap_samples: usize,
+}
+
+/// 預先生成「本車道走廊」重疊區候選取樣點 (|x| <= 2.4m，完全排除相鄰車道車輛與護欄干擾)
+fn generate_overlap_candidates() -> Vec<(f32, f32)> {
+    let mut pts = Vec::with_capacity(420);
+    let nx = 16;
+    let ny = 30;
+    for iy in 0..=ny {
+        let y = -5.5 + (iy as f32 / ny as f32) * 10.2;
+        for ix in 0..=nx {
+            let x = -2.4 + (ix as f32 / nx as f32) * 4.8;
+            if x.abs() <= 0.95 && y.abs() <= 2.40 {
+                continue;
+            }
+            if x.abs() >= 0.75 && y.abs() >= 1.15 {
+                pts.push((x, y));
+            }
+        }
+    }
+    pts
+}
+
+/// 計算「本車道重疊區光度誤差 + 本車道左右標線筆直度與跨鏡頭對齊誤差」：
+/// 1) 僅看 |x| <= 2.4m 本車道走廊，完全忽略相鄰車道車輛
+/// 2) 以左右鏡頭車側標線為基準 X，要求前後鏡頭遠近車道線保持垂直筆直且無縫對齊
+fn eval_alignment_loss(
+    frames: &[&[u8]; 4],
+    params: &[CameraParam; 4],
+    candidates: &[(f32, f32)],
+) -> (f32, usize) {
+    let (cams, axes) = build_cams_and_axes(params);
+    const PAIRS: [(usize, usize); 4] = [(0, 2), (0, 3), (1, 2), (1, 3)];
+
+    let mut total_sq_err = 0.0_f32;
+    let mut total_cnt = 0_usize;
+
+    for &(ca, cb) in &PAIRS {
+        let mut samples_a = Vec::with_capacity(64);
+        let mut samples_b = Vec::with_capacity(64);
+        let mut sum_a = 0.0_f32;
+        let mut sum_b = 0.0_f32;
+
+        for &(xw, yw) in candidates {
+            if let (Some((uva, _)), Some((uvb, _))) = (
+                cams[ca].project_and_weight(&axes[ca], xw, yw),
+                cams[cb].project_and_weight(&axes[cb], xw, yw),
+            ) {
+                if let (Some(rgba), Some(rgbb)) = (
+                    sample_rgb_bilinear(frames[ca], FRAME_W, FRAME_H, uva),
+                    sample_rgb_bilinear(frames[cb], FRAME_W, FRAME_H, uvb),
+                ) {
+                    let la = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2];
+                    let lb = 0.299 * rgbb[0] + 0.587 * rgbb[1] + 0.114 * rgbb[2];
+                    samples_a.push(la);
+                    samples_b.push(lb);
+                    sum_a += la;
+                    sum_b += lb;
+                }
+            }
+        }
+
+        let n = samples_a.len();
+        if n >= 6 {
+            let mean_a = sum_a / n as f32;
+            let mean_b = sum_b / n as f32;
+            for i in 0..n {
+                let da = samples_a[i] - mean_a;
+                let db = samples_b[i] - mean_b;
+                let diff = da - db;
+                total_sq_err += diff * diff;
+            }
+            total_cnt += n;
+        }
+    }
+
+    if total_cnt < 24 {
+        return (1e6, total_cnt);
+    }
+
+    let overlap_rmse = (total_sq_err / total_cnt as f32).sqrt() * 255.0;
+
+    // 分區追蹤本車道左右標線 (|x| ∈ [1.05, 2.50]) 並要求前後鏡頭筆直對齊車側基準
+    let find_cam_line_xs = |cam_idx: usize, y_start: f32, y_end: f32, steps: usize, side: f32| -> Vec<(f32, f32)> {
+        let mut pts = Vec::new();
+        for iy in 0..steps {
+            let yw = y_start + (iy as f32 / (steps - 1).max(1) as f32) * (y_end - y_start);
+            let mut xs_row = [0.0_f32; 21];
+            let mut lums_row = [0.0_f32; 21];
+            let mut row_sum = 0.0_f32;
+            let mut row_cnt = 0_usize;
+            for ix in 0..21 {
+                let xw = side * (1.05 + (ix as f32 / 20.0) * 1.45);
+                if let Some((uv, _)) = cams[cam_idx].project_and_weight(&axes[cam_idx], xw, yw) {
+                    if let Some(rgb) = sample_rgb_bilinear(frames[cam_idx], FRAME_W, FRAME_H, uv) {
+                        let lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+                        xs_row[ix] = xw;
+                        lums_row[ix] = lum;
+                        row_sum += lum;
+                        row_cnt += 1;
+                    }
+                }
+            }
+            if row_cnt >= 10 {
+                let mean_l = row_sum / row_cnt as f32;
+                let mut best_c = 0.0_f32;
+                let mut best_x = 0.0_f32;
+                for ix in 0..21 {
+                    let c = lums_row[ix] - mean_l;
+                    if xs_row[ix] != 0.0 && c > best_c {
+                        best_c = c;
+                        best_x = xs_row[ix];
+                    }
+                }
+                if best_c > 0.07 {
+                    pts.push((yw, best_x));
+                }
+            }
+        }
+        pts
+    };
+
+    let mut straight_pen = 0.0_f32;
+    for &(side, side_cam) in &[(-1.0_f32, 2_usize), (1.0_f32, 3_usize)] {
+        let side_pts = find_cam_line_xs(side_cam, -1.8, 1.8, 12, side);
+        let ref_x = if side_pts.len() >= 3 {
+            side_pts.iter().map(|p| p.1).sum::<f32>() / side_pts.len() as f32
+        } else {
+            side * 1.65
+        };
+
+        if side_pts.len() >= 4 {
+            let var = side_pts.iter().map(|p| (p.1 - ref_x).powi(2)).sum::<f32>() / side_pts.len() as f32;
+            straight_pen += var.sqrt() * 80.0;
+        }
+
+        for &(cam_idx, y0, y1) in &[(0_usize, 2.2_f32, 4.9_f32), (1_usize, -5.5_f32, -2.2_f32)] {
+            let pts = find_cam_line_xs(cam_idx, y0, y1, 14, side);
+            if pts.len() >= 4 {
+                let err_to_ref = (pts.iter().map(|p| (p.1 - ref_x).powi(2)).sum::<f32>() / pts.len() as f32).sqrt();
+                straight_pen += err_to_ref * 110.0;
+            } else {
+                straight_pen += 25.0;
+            }
+        }
+    }
+
+    (overlap_rmse + straight_pen, total_cnt)
+}
+
+/// 稀疏直接法 + 本車道直線度優化之自動外參對齊：
+/// 忽略相鄰車道車輛干擾，專注讓本車道左右標線在跨鏡頭交界與遠近處皆保持平行筆直。
+pub fn auto_align_extrinsics(
+    frames: &[Option<Vec<u8>>; 4],
+    params: &mut [CameraParam; 4],
+) -> Result<AutoAlignReport, String> {
+    let f0 = frames[0].as_deref().ok_or("前視鏡頭尚未有畫面影格")?;
+    let f1 = frames[1].as_deref().ok_or("後視鏡頭尚未有畫面影格")?;
+    let f2 = frames[2].as_deref().ok_or("左側鏡頭尚未有畫面影格")?;
+    let f3 = frames[3].as_deref().ok_or("右側鏡頭尚未有畫面影格")?;
+    let frame_refs = [f0, f1, f2, f3];
+
+    let candidates = generate_overlap_candidates();
+    let (before_loss, before_cnt) = eval_alignment_loss(&frame_refs, params, &candidates);
+    if before_cnt < 24 {
+        return Err(format!(
+            "重疊區有效取樣點不足 ({} 點)，請先調整基礎 FOV 或確認四路畫面已載入",
+            before_cnt
+        ));
+    }
+
+    let mut best_params = *params;
+    let mut best_loss = before_loss;
+    let mut best_cnt = before_cnt;
+
+    // 多尺度座標下降：角度 (多輪收斂) + 縮放 + 平移
+    let angle_steps: &[i32] = &[8, 4, 2, 1];
+    let zoom_steps: &[f32] = &[0.08, 0.03];
+    let offset_steps: &[f32] = &[0.08, 0.03, 0.01];
+
+    for &ang_step in angle_steps {
+        for cam_idx in 0..4 {
+            for field in 0..3 {
+                loop {
+                    let mut improved = false;
+                    for &dir in &[-1_i32, 1_i32] {
+                        let mut trial = best_params;
+                        match field {
+                            0 => trial[cam_idx].yaw = (trial[cam_idx].yaw + dir * ang_step).clamp(-10, 10),
+                            1 => trial[cam_idx].pitch = (trial[cam_idx].pitch + dir * ang_step).clamp(-35, 35),
+                            _ => trial[cam_idx].roll = (trial[cam_idx].roll + dir * ang_step).clamp(-10, 10),
+                        }
+                        if trial[cam_idx].yaw == best_params[cam_idx].yaw
+                            && trial[cam_idx].pitch == best_params[cam_idx].pitch
+                            && trial[cam_idx].roll == best_params[cam_idx].roll
+                        {
+                            continue;
+                        }
+                        let (loss, cnt) = eval_alignment_loss(&frame_refs, &trial, &candidates);
+                        if cnt >= (before_cnt / 2).max(24) && loss < best_loss - 0.02 {
+                            best_loss = loss;
+                            best_params = trial;
+                            best_cnt = cnt;
+                            improved = true;
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for &zoom_step in zoom_steps {
+        for cam_idx in 0..4 {
+            for &dir in &[-1.0_f32, 1.0_f32] {
+                let mut trial = best_params;
+                trial[cam_idx].zoom = (trial[cam_idx].zoom + dir * zoom_step).clamp(0.70, 1.40);
+                let (loss, cnt) = eval_alignment_loss(&frame_refs, &trial, &candidates);
+                if cnt >= (before_cnt / 2).max(24) && loss < best_loss {
+                    best_loss = loss;
+                    best_params = trial;
+                    best_cnt = cnt;
+                }
+            }
+        }
+    }
+
+    for &off_step in offset_steps {
+        for cam_idx in 0..4 {
+            for field in 0..2 {
+                for &dir in &[-1.0_f32, 1.0_f32] {
+                    let mut trial = best_params;
+                    match field {
+                        0 => trial[cam_idx].offset_x = (trial[cam_idx].offset_x + dir * off_step).clamp(-0.6, 0.6),
+                        _ => trial[cam_idx].offset_y = (trial[cam_idx].offset_y + dir * off_step).clamp(-0.6, 0.6),
+                    }
+                    let (loss, cnt) = eval_alignment_loss(&frame_refs, &trial, &candidates);
+                    if cnt >= (before_cnt / 2).max(24) && loss < best_loss {
+                        best_loss = loss;
+                        best_params = trial;
+                        best_cnt = cnt;
+                    }
+                }
+            }
+        }
+    }
+
+    *params = best_params;
+    let improved_pct = if before_loss > 1e-4 {
+        ((before_loss - best_loss) / before_loss * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    Ok(AutoAlignReport {
+        before_rmse: before_loss,
+        after_rmse: best_loss,
+        improved_pct,
+        overlap_samples: best_cnt,
+    })
+}
+
+/// 離線 CLI 驗證輔助：讀取 1920x1080 四象限魚眼影格並輸出升級前後鳥瞰圖對比
+pub fn run_verify_birdview_cli(input_path: &str, out_dir: &str) {
+    use image::{imageops::FilterType, GenericImageView, Rgba, RgbaImage};
+
+    let src = image::open(input_path).expect("無法開啟輸入圖片");
+    let (w, h) = src.dimensions();
+    let hw = w / 2;
+    let hh = h / 2;
+
+    let rects = [
+        (0, 0, hw, hh),   // 0: Front (TL)
+        (hw, 0, hw, hh),  // 1: Rear (TR)
+        (0, hh, hw, hh),  // 2: Left (BL)
+        (hw, hh, hw, hh), // 3: Right (BR)
+    ];
+
+    let mut frames_vec: Vec<Vec<u8>> = Vec::with_capacity(4);
+    for &(x, y, cw, ch) in &rects {
+        let crop = src.crop_imm(x, y, cw, ch);
+        let resized = crop.resize_exact(FRAME_W as u32, FRAME_H as u32, FilterType::Triangle);
+        frames_vec.push(resized.to_rgba8().into_raw());
+    }
+
+    let frames_opt: [Option<Vec<u8>>; 4] = [
+        Some(frames_vec[0].clone()),
+        Some(frames_vec[1].clone()),
+        Some(frames_vec[2].clone()),
+        Some(frames_vec[3].clone()),
+    ];
+    let frame_refs: [&[u8]; 4] = [
+        &frames_vec[0],
+        &frames_vec[1],
+        &frames_vec[2],
+        &frames_vec[3],
+    ];
+
+    let car_img = image::load_from_memory(CAR_TOPVIEW_BYTES)
+        .expect("無法載入 car_topview.png")
+        .to_rgba8();
+
+    let render_img = |params: &[CameraParam; 4],
+                      gains: &[[f32; 3]; 4],
+                      bowl_strength: f32,
+                      seam_sharpness: f32|
+     -> RgbaImage {
+        let out_w = 540_u32;
+        let out_h = 825_u32;
+        let mut img = RgbaImage::from_pixel(out_w, out_h, Rgba([26, 28, 34, 255]));
+        let (cams, axes) = build_cams_and_axes(params);
+
+        let world_w = 7.2_f32;
+        let half_w = world_w * 0.5;
+        let y_max = 5.0_f32;
+        let y_min = -6.0_f32;
+        let world_h = y_max - y_min;
+
+        for py in 0..out_h {
+            let ty = py as f32 / (out_h - 1) as f32;
+            let y_world = y_max - ty * world_h;
+            for px in 0..out_w {
+                let tx = px as f32 / (out_w - 1) as f32;
+                let x_world = -half_w + tx * world_w;
+                let z_world = bowl_height(x_world, y_world, bowl_strength);
+
+                let mut acc = [0.0_f32; 3];
+                let mut total_w = 0.0_f32;
+                for k in 0..4 {
+                    if let Some((uv, w)) = cams[k].project_and_weight_z(&axes[k], x_world, y_world, z_world) {
+                        if let Some(rgb) = sample_rgb_bilinear(frame_refs[k], FRAME_W, FRAME_H, uv) {
+                            let ws = w.powf(seam_sharpness);
+                            for c in 0..3 {
+                                acc[c] += rgb[c] * 255.0 * gains[k][c] * ws;
+                            }
+                            total_w += ws;
+                        }
+                    }
+                }
+                if total_w > 1e-12 {
+                    let r = (acc[0] / total_w).round().clamp(0.0, 255.0) as u8;
+                    let g = (acc[1] / total_w).round().clamp(0.0, 255.0) as u8;
+                    let b = (acc[2] / total_w).round().clamp(0.0, 255.0) as u8;
+                    img.put_pixel(px, py, Rgba([r, g, b, 255]));
+                }
+            }
+        }
+
+        let car_w = ((1.82 / world_w) * out_w as f32).round() as u32;
+        let car_h = ((4.70 / world_h) * out_h as f32).round() as u32;
+        let car_resized = image::imageops::resize(&car_img, car_w, car_h, FilterType::Triangle);
+        let cx = (out_w - car_w) / 2;
+        let cy = ((y_max / world_h) * out_h as f32).round() as u32 - car_h / 2;
+        image::imageops::overlay(&mut img, &car_resized, cx as i64, cy as i64);
+        img
+    };
+
+    let mut params = CameraParam::default_presets();
+    let before_img = render_img(&params, &[[1.0; 3]; 4], 0.0, 1.0);
+    let before_path = format!("{}/road_bev_before.png", out_dir);
+    before_img.save(&before_path).expect("儲存 before 失敗");
+    println!("Saved {}", before_path);
+
+    match auto_align_extrinsics(&frames_opt, &mut params) {
+        Ok(report) => {
+            println!(
+                "AutoAlignReport: before_rmse={:.3}, after_rmse={:.3}, improved={:.2}%, samples={}",
+                report.before_rmse, report.after_rmse, report.improved_pct, report.overlap_samples
+            );
+            for (i, p) in params.iter().enumerate() {
+                println!(
+                    "  Cam {}: yaw={}, pitch={}, roll={}, offset_x={:.2}, offset_y={:.2}",
+                    i, p.yaw, p.pitch, p.roll, p.offset_x, p.offset_y
+                );
+            }
+        }
+        Err(e) => println!("AutoAlign failed: {}", e),
+    }
+
+    let mut renderer = BirdViewRenderer::default();
+    for g in 1..=12 {
+        renderer.update_auto_gain(&frames_opt, &params, g);
+    }
+    println!("AutoGain RGB: {:?}", renderer.cam_rgb_gains);
+
+    let after_img = render_img(
+        &params,
+        &renderer.cam_rgb_gains,
+        renderer.bowl_strength,
+        renderer.seam_sharpness,
+    );
+    let after_path = format!("{}/road_bev_after.png", out_dir);
+    after_img.save(&after_path).expect("儲存 after 失敗");
+    println!("Saved {}", after_path);
 }
 
 /// 射線與車體 AABB 包圍盒相交檢測 (檢測光線在到達地面 target 之前是否被車體 origin->target 遮蔽)
@@ -267,6 +744,11 @@ pub struct BirdViewRenderer {
     pub seam_lines: bool,
     pub uv_road_split: f32, // 地面遠端取景比率 (預設 0.44)
     pub seam_spread: f32,   // 前後視角扇區展開角度比例 (預設 1.00)
+    pub bowl_strength: f32, // 3D 碗狀曲面強度 (0.0 = 純平面, 0.35 = 預設柔和碗狀)
+    pub seam_sharpness: f32, // 接縫銳利度 (1.0 = 寬羽化, 2.5 = 預設緊緻融合)
+    pub auto_gain: bool,    // 自動亮度/色差增益補償
+    pub cam_rgb_gains: [[f32; 3]; 4],
+    last_gain_frame_gen: u64,
 }
 
 impl Default for BirdViewRenderer {
@@ -277,6 +759,11 @@ impl Default for BirdViewRenderer {
             seam_lines: false,  // 預設隱藏接縫線以達到無縫視覺效果
             uv_road_split: 0.44,
             seam_spread: 1.00,  // 預設展開至鳥瞰圖外框四個角落 (最大前後視野角度)
+            bowl_strength: 0.0, // 預設純平面 Z=0，確保車道線筆直平行不彎曲
+            seam_sharpness: 2.5,
+            auto_gain: true,
+            cam_rgb_gains: [[1.0; 3]; 4],
+            last_gain_frame_gen: 0,
         }
     }
 }
@@ -297,6 +784,94 @@ impl BirdViewRenderer {
         let id = tex.id();
         self.car_texture = Some(tex);
         id
+    }
+
+    /// 根據 4 路重疊扇區的平均 RGB 統計，自動計算平滑曝光與白平衡增益補償
+    pub fn update_auto_gain(
+        &mut self,
+        frames: &[Option<Vec<u8>>; 4],
+        camera_params: &[CameraParam; 4],
+        frame_gen: u64,
+    ) {
+        if !self.auto_gain {
+            self.cam_rgb_gains = [[1.0; 3]; 4];
+            return;
+        }
+        if frame_gen == self.last_gain_frame_gen {
+            return;
+        }
+        let (Some(f0), Some(f1), Some(f2), Some(f3)) = (
+            frames[0].as_deref(),
+            frames[1].as_deref(),
+            frames[2].as_deref(),
+            frames[3].as_deref(),
+        ) else {
+            return;
+        };
+        self.last_gain_frame_gen = frame_gen;
+
+        let frame_refs = [f0, f1, f2, f3];
+        let (cams, axes) = build_cams_and_axes(camera_params);
+        let candidates = generate_overlap_candidates();
+
+        let mut sum_rgb = [[0.0_f32; 3]; 4];
+        let mut counts = [0_usize; 4];
+
+        // 僅在任兩顆鏡頭有重疊的區域統計 RGB，避免因各自看到不同方向物體導致誤判
+        for &(xw, yw) in candidates.iter().step_by(2) {
+            let mut active = [None; 4];
+            let mut n_active = 0_usize;
+            for k in 0..4 {
+                if let Some((uv, _)) = cams[k].project_and_weight(&axes[k], xw, yw) {
+                    active[k] = Some(uv);
+                    n_active += 1;
+                }
+            }
+            if n_active >= 2 {
+                for k in 0..4 {
+                    if let Some(uv) = active[k] {
+                        if let Some(rgb) = sample_rgb_bilinear(frame_refs[k], FRAME_W, FRAME_H, uv) {
+                            for c in 0..3 {
+                                sum_rgb[k][c] += rgb[c];
+                            }
+                            counts[k] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut mean_rgb = [[0.5_f32; 3]; 4];
+        for k in 0..4 {
+            if counts[k] < 8 {
+                return;
+            }
+            for c in 0..3 {
+                mean_rgb[k][c] = (sum_rgb[k][c] / counts[k] as f32).max(0.05);
+            }
+        }
+
+        let mut global_c = [0.0_f32; 3];
+        for c in 0..3 {
+            global_c[c] = (mean_rgb[0][c] + mean_rgb[1][c] + mean_rgb[2][c] + mean_rgb[3][c]) * 0.25;
+        }
+
+        let mut target = [[1.0_f32; 3]; 4];
+        let mut max_g = 1.0_f32;
+        for k in 0..4 {
+            for c in 0..3 {
+                target[k][c] = (global_c[c] / mean_rgb[k][c]).clamp(0.72, 1.32);
+                max_g = max_g.max(target[k][c]);
+            }
+        }
+        // 歸一化使最大值 <= 1.0 (egui Vertex::color 為 0..255)
+        let inv_max = 1.0 / max_g;
+        for k in 0..4 {
+            for c in 0..3 {
+                let g = (target[k][c] * inv_max).clamp(0.60, 1.0);
+                self.cam_rgb_gains[k][c] = self.cam_rgb_gains[k][c] * 0.75 + g * 0.25;
+            }
+        }
     }
 
     /// 檢測滑鼠在鳥瞰圖點擊了哪一個鏡頭扇區 (0: 前視 Front, 1: 後視 Rear, 2: 左側 Left, 3: 右側 Right)
@@ -404,12 +979,15 @@ impl BirdViewRenderer {
                 let mut uvs = [Pos2::ZERO; 4];
                 let mut weights = [0.0_f32; 4];
                 let mut total_w = 0.0_f32;
+                let z_world = bowl_height(x_world, y_world, self.bowl_strength);
+                let sharp = self.seam_sharpness.clamp(1.0, 6.0);
 
                 for k in 0..4 {
-                    if let Some((uv, w)) = cams[k].project_and_weight(&axes[k], x_world, y_world) {
+                    if let Some((uv, w)) = cams[k].project_and_weight_z(&axes[k], x_world, y_world, z_world) {
+                        let w_sharp = w.powf(sharp);
                         uvs[k] = uv;
-                        weights[k] = w;
-                        total_w += w;
+                        weights[k] = w_sharp;
+                        total_w += w_sharp;
                     }
                 }
 
@@ -424,24 +1002,29 @@ impl BirdViewRenderer {
 
         // =========================================================================
         // 5. 分層繪製各鏡頭網格 (底層: 左右兩側 Left cam 2 / Right cam 3；頂層: 前後 Front cam 0 / Rear cam 1)
-        //    在重疊過渡區以歸一化權重 alpha = w_upper / (w_upper + w_lower) 實現 100% 精確的物理平滑融合
+        //    套用接縫銳利化權重歸一化與自動 RGB 曝光/白平衡增益補償
         // =========================================================================
-
-        // --- 5A. 底層左側網格 (LEFT - cam 2) ---
-        if let Some(tex_id) = textures[2] {
+        for &cam_idx in &[2_usize, 3, 0, 1] {
+            let Some(tex_id) = textures[cam_idx] else {
+                continue;
+            };
+            let gain = self.cam_rgb_gains[cam_idx];
             let mut mesh = Mesh::with_texture(tex_id);
             for node in &nodes {
-                let w2 = node.weights[2];
-                let alpha = if node.total_w > 1e-6 {
-                    (w2 / node.total_w).clamp(0.0, 1.0)
+                let wk = node.weights[cam_idx];
+                let alpha = if node.total_w > 1e-12 {
+                    (wk / node.total_w).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
+                let r = (alpha * gain[0] * 255.0).round().clamp(0.0, 255.0) as u8;
+                let g = (alpha * gain[1] * 255.0).round().clamp(0.0, 255.0) as u8;
+                let b = (alpha * gain[2] * 255.0).round().clamp(0.0, 255.0) as u8;
                 let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
                 mesh.vertices.push(egui::epaint::Vertex {
                     pos: node.pos,
-                    uv: node.uvs[2],
-                    color: Color32::from_rgba_premultiplied(a, a, a, a),
+                    uv: node.uvs[cam_idx],
+                    color: Color32::from_rgba_premultiplied(r, g, b, a),
                 });
             }
             for iy in 0..ny as u32 {
@@ -450,118 +1033,10 @@ impl BirdViewRenderer {
                     let i10 = i00 + 1;
                     let i01 = (iy + 1) * stride + ix;
                     let i11 = i01 + 1;
-                    if nodes[i00 as usize].weights[2] > 0.0
-                        || nodes[i10 as usize].weights[2] > 0.0
-                        || nodes[i01 as usize].weights[2] > 0.0
-                        || nodes[i11 as usize].weights[2] > 0.0
-                    {
-                        mesh.add_triangle(i00, i10, i11);
-                        mesh.add_triangle(i00, i11, i01);
-                    }
-                }
-            }
-            painter.add(mesh);
-        }
-
-        // --- 5B. 底層右側網格 (RIGHT - cam 3) ---
-        if let Some(tex_id) = textures[3] {
-            let mut mesh = Mesh::with_texture(tex_id);
-            for node in &nodes {
-                let w3 = node.weights[3];
-                let alpha = if node.total_w > 1e-6 {
-                    (w3 / node.total_w).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-                mesh.vertices.push(egui::epaint::Vertex {
-                    pos: node.pos,
-                    uv: node.uvs[3],
-                    color: Color32::from_rgba_premultiplied(a, a, a, a),
-                });
-            }
-            for iy in 0..ny as u32 {
-                for ix in 0..nx as u32 {
-                    let i00 = iy * stride + ix;
-                    let i10 = i00 + 1;
-                    let i01 = (iy + 1) * stride + ix;
-                    let i11 = i01 + 1;
-                    if nodes[i00 as usize].weights[3] > 0.0
-                        || nodes[i10 as usize].weights[3] > 0.0
-                        || nodes[i01 as usize].weights[3] > 0.0
-                        || nodes[i11 as usize].weights[3] > 0.0
-                    {
-                        mesh.add_triangle(i00, i10, i11);
-                        mesh.add_triangle(i00, i11, i01);
-                    }
-                }
-            }
-            painter.add(mesh);
-        }
-
-        // --- 5C. 頂層前視網格 (FRONT - cam 0) ---
-        if let Some(tex_id) = textures[0] {
-            let mut mesh = Mesh::with_texture(tex_id);
-            for node in &nodes {
-                let w0 = node.weights[0];
-                let alpha = if node.total_w > 1e-6 {
-                    (w0 / node.total_w).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-                mesh.vertices.push(egui::epaint::Vertex {
-                    pos: node.pos,
-                    uv: node.uvs[0],
-                    color: Color32::from_rgba_premultiplied(a, a, a, a),
-                });
-            }
-            for iy in 0..ny as u32 {
-                for ix in 0..nx as u32 {
-                    let i00 = iy * stride + ix;
-                    let i10 = i00 + 1;
-                    let i01 = (iy + 1) * stride + ix;
-                    let i11 = i01 + 1;
-                    if nodes[i00 as usize].weights[0] > 0.0
-                        || nodes[i10 as usize].weights[0] > 0.0
-                        || nodes[i01 as usize].weights[0] > 0.0
-                        || nodes[i11 as usize].weights[0] > 0.0
-                    {
-                        mesh.add_triangle(i00, i10, i11);
-                        mesh.add_triangle(i00, i11, i01);
-                    }
-                }
-            }
-            painter.add(mesh);
-        }
-
-        // --- 5D. 頂層後視網格 (REAR - cam 1) ---
-        if let Some(tex_id) = textures[1] {
-            let mut mesh = Mesh::with_texture(tex_id);
-            for node in &nodes {
-                let w1 = node.weights[1];
-                let alpha = if node.total_w > 1e-6 {
-                    (w1 / node.total_w).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let a = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-                mesh.vertices.push(egui::epaint::Vertex {
-                    pos: node.pos,
-                    uv: node.uvs[1],
-                    color: Color32::from_rgba_premultiplied(a, a, a, a),
-                });
-            }
-            for iy in 0..ny as u32 {
-                for ix in 0..nx as u32 {
-                    let i00 = iy * stride + ix;
-                    let i10 = i00 + 1;
-                    let i01 = (iy + 1) * stride + ix;
-                    let i11 = i01 + 1;
-                    if nodes[i00 as usize].weights[1] > 0.0
-                        || nodes[i10 as usize].weights[1] > 0.0
-                        || nodes[i01 as usize].weights[1] > 0.0
-                        || nodes[i11 as usize].weights[1] > 0.0
+                    if nodes[i00 as usize].weights[cam_idx] > 0.0
+                        || nodes[i10 as usize].weights[cam_idx] > 0.0
+                        || nodes[i01 as usize].weights[cam_idx] > 0.0
+                        || nodes[i11 as usize].weights[cam_idx] > 0.0
                     {
                         mesh.add_triangle(i00, i10, i11);
                         mesh.add_triangle(i00, i11, i01);
@@ -699,5 +1174,103 @@ impl BirdViewRenderer {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bowl_height_flat_near_car_and_curved_far() {
+        assert_eq!(bowl_height(0.0, 0.0, 0.5), 0.0);
+        assert_eq!(bowl_height(1.2, 2.5, 0.5), 0.0);
+        assert_eq!(bowl_height(3.5, 4.5, 0.0), 0.0);
+        let h_far = bowl_height(3.5, 4.5, 0.5);
+        assert!(h_far > 0.0 && h_far <= 1.35);
+    }
+
+    #[test]
+    fn test_auto_gain_balances_brightness() {
+        // 建立 4 張純色假影格，cam 0 較暗 (80), cam 1..3 較亮 (180)
+        let make_frame = |val: u8| -> Vec<u8> {
+            let mut v = vec![0_u8; FRAME_W * FRAME_H * 4];
+            for px in v.chunks_exact_mut(4) {
+                px[0] = val;
+                px[1] = val;
+                px[2] = val;
+                px[3] = 255;
+            }
+            v
+        };
+        let frames = [
+            Some(make_frame(80)),
+            Some(make_frame(180)),
+            Some(make_frame(180)),
+            Some(make_frame(180)),
+        ];
+        let params = CameraParam::default_presets();
+        let mut renderer = BirdViewRenderer::default();
+        for gen in 1..=10 {
+            renderer.update_auto_gain(&frames, &params, gen);
+        }
+        // cam 0 的增益應該高於 cam 1
+        assert!(renderer.cam_rgb_gains[0][0] > renderer.cam_rgb_gains[1][0]);
+    }
+
+    #[test]
+    fn test_auto_align_extrinsics_reduces_error_on_synthetic_ground() {
+        // 用預設參數在地面畫一個棋盤格紋理，再把 cam 0 yaw 偏移 +4° 後測試能否自動對齊降誤差
+        let true_params = CameraParam::default_presets();
+        let (cams, axes) = build_cams_and_axes(&true_params);
+
+        let mut raw_frames = [
+            vec![128_u8; FRAME_W * FRAME_H * 4],
+            vec![128_u8; FRAME_W * FRAME_H * 4],
+            vec![128_u8; FRAME_W * FRAME_H * 4],
+            vec![128_u8; FRAME_W * FRAME_H * 4],
+        ];
+
+        // 將世界地面方格圖案反投影寫入 4 個鏡頭的假影格
+        for iy in 0..120 {
+            let yw = -5.5 + (iy as f32 / 119.0) * 10.0;
+            for ix in 0..90 {
+                let xw = -3.4 + (ix as f32 / 89.0) * 6.8;
+                let checker = (((xw * 1.5).floor() as i32 + (yw * 1.5).floor() as i32) & 1) == 0;
+                let val = if checker { 220_u8 } else { 40_u8 };
+                for k in 0..4 {
+                    if let Some((uv, _)) = cams[k].project_and_weight(&axes[k], xw, yw) {
+                        let px = (uv.x * (FRAME_W - 1) as f32).round() as usize;
+                        let py = (uv.y * (FRAME_H - 1) as f32).round() as usize;
+                        for dy in -1_isize..=1 {
+                            for dx in -1_isize..=1 {
+                                let nx = (px as isize + dx).clamp(0, FRAME_W as isize - 1) as usize;
+                                let ny = (py as isize + dy).clamp(0, FRAME_H as isize - 1) as usize;
+                                let idx = (ny * FRAME_W + nx) * 4;
+                                raw_frames[k][idx] = val;
+                                raw_frames[k][idx + 1] = val;
+                                raw_frames[k][idx + 2] = val;
+                                raw_frames[k][idx + 3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let frames = [
+            Some(raw_frames[0].clone()),
+            Some(raw_frames[1].clone()),
+            Some(raw_frames[2].clone()),
+            Some(raw_frames[3].clone()),
+        ];
+
+        let mut perturbed = true_params;
+        perturbed[0].yaw = 4;
+        perturbed[2].pitch = -3;
+
+        let report = auto_align_extrinsics(&frames, &mut perturbed).expect("auto align should succeed");
+        assert!(report.after_rmse < report.before_rmse);
+        assert!(report.overlap_samples >= 24);
     }
 }

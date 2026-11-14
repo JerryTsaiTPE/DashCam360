@@ -57,6 +57,14 @@ fn setup_custom_chinese_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--verify-birdview") {
+        let input_path = args.get(2).map(|s| s.as_str()).unwrap_or("output/road_frame_raw.png");
+        let out_dir = args.get(3).map(|s| s.as_str()).unwrap_or("output");
+        birdview::run_verify_birdview_cli(input_path, out_dir);
+        return Ok(());
+    }
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DashCam360 Native - 汽車環景魚眼校正與 3D 空間投影系統 (Rust 高效原生版)")

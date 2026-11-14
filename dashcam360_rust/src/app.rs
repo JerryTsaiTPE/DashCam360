@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui::{self, Color32, Mesh, Pos2, Rect, RichText, Stroke, Vec2};
 
-use crate::birdview::BirdViewRenderer;
+use crate::birdview::{auto_align_extrinsics, BirdViewRenderer};
 use crate::ffmpeg_worker::{
     generate_demo_sample, probe_video_duration, start_processing, CameraParam, ProcessConfig,
     WorkerMessage,
@@ -106,7 +106,7 @@ impl DashCamApp {
             show_horizon_crosshair: false,
             is_processing: false,
             progress_pct: 0.0,
-            status_message: "就緒 (已套用實車無縫鳥瞰與雙白線預設參數)".to_string(),
+            status_message: "就緒 (已預設套用 default.json 校正參數)".to_string(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             tx_worker: tx,
             rx_worker: rx,
@@ -115,12 +115,17 @@ impl DashCamApp {
             player: QuadPlayer::new(),
         };
 
+        // 啟動時預設套用 default.json 校正參數
+        if app.load_default_profile() {
+            app.status_message = "就緒 (已預設套用 default.json 校正參數)".to_string();
+        }
+
         // 優先載入四路原始魚眼影片進行即時 4 象限串流，確保鳥瞰圖與即時預覽不會被二次扭曲
         let demo = PathBuf::from("sample_videos/demo_quad_fisheye.mp4");
         if demo.exists() {
             app.player.load_quad_video(demo.clone(), app.mapping.clone());
             app.input_path = Some(demo);
-            app.status_message = "已載入實車四路魚眼串流並套用無縫鳥瞰預設參數".to_string();
+            app.status_message = "已載入實車四路魚眼串流並套用 default.json 預設參數".to_string();
         } else {
             let f = app.output_dir.join("front.mp4");
             let r = app.output_dir.join("rear.mp4");
@@ -189,6 +194,9 @@ impl DashCamApp {
                 birdview_uv_road_split: self.birdview.uv_road_split,
                 birdview_show_guides: self.birdview.show_guides,
                 birdview_seam_lines: self.birdview.seam_lines,
+                birdview_bowl_strength: self.birdview.bowl_strength,
+                birdview_seam_sharpness: self.birdview.seam_sharpness,
+                birdview_auto_gain: self.birdview.auto_gain,
                 viewer_mirror_offset_z: self.viewer.mirror_offset_z,
                 viewer_floor_radius: self.viewer.floor_radius,
                 viewer_wall_radius: self.viewer.wall_radius,
@@ -212,6 +220,136 @@ impl DashCamApp {
         }
     }
 
+    fn apply_calibration_profile(&mut self, profile: CalibrationProfile) {
+        self.mapping = profile.mapping;
+        self.camera_params = profile.preview_camera_params;
+        self.birdview_camera_params = profile.birdview_camera_params;
+        self.birdview.seam_spread = profile.birdview_seam_spread;
+        self.birdview.uv_road_split = profile.birdview_uv_road_split;
+        self.birdview.show_guides = profile.birdview_show_guides;
+        self.birdview.seam_lines = profile.birdview_seam_lines;
+        self.birdview.bowl_strength = profile.birdview_bowl_strength;
+        self.birdview.seam_sharpness = profile.birdview_seam_sharpness;
+        self.birdview.auto_gain = profile.birdview_auto_gain;
+        self.viewer.mirror_offset_z = profile.viewer_mirror_offset_z;
+        self.viewer.floor_radius = profile.viewer_floor_radius;
+        self.viewer.wall_radius = profile.viewer_wall_radius;
+        self.viewer.wall_height = profile.viewer_wall_height;
+    }
+
+    /// 啟動時搜尋並套用 default.json，若磁碟上找不到則回退使用內嵌的 sample/default.json
+    fn load_default_profile(&mut self) -> bool {
+        let mut candidates = vec![
+            PathBuf::from("default.json"),
+            PathBuf::from("sample/default.json"),
+        ];
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                candidates.push(exe_dir.join("default.json"));
+                candidates.push(exe_dir.join("sample/default.json"));
+                if let Some(p1) = exe_dir.parent() {
+                    candidates.push(p1.join("sample/default.json"));
+                    if let Some(p2) = p1.parent() {
+                        candidates.push(p2.join("sample/default.json"));
+                        if let Some(p3) = p2.parent() {
+                            candidates.push(p3.join("sample/default.json"));
+                        }
+                    }
+                }
+            }
+        }
+
+        for path in candidates {
+            if path.is_file() {
+                if let Ok(json_str) = std::fs::read_to_string(&path) {
+                    if let Ok(profile) = serde_json::from_str::<CalibrationProfile>(&json_str) {
+                        self.apply_calibration_profile(profile);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        const EMBEDDED_DEFAULT_JSON: &str = include_str!("../default.json");
+        if let Ok(profile) = serde_json::from_str::<CalibrationProfile>(EMBEDDED_DEFAULT_JSON) {
+            self.apply_calibration_profile(profile);
+            return true;
+        }
+        false
+    }
+
+    fn load_video_file(&mut self, file: PathBuf) {
+        let d = probe_video_duration(&file);
+        self.input_duration_sec = d;
+        self.input_path = Some(file.clone());
+        self.player.load_quad_video(file.clone(), self.mapping.clone());
+        let fname = file.file_name().unwrap_or_default().to_string_lossy();
+        self.status_message = format!("已載入影片四路完整魚眼串流: {}", fname);
+    }
+
+    fn is_supported_video_file(path: &std::path::Path) -> bool {
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            return false;
+        };
+        matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "mp4" | "mkv" | "avi" | "mov" | "ts" | "m4v" | "webm"
+        )
+    }
+
+    fn handle_drag_and_drop(&mut self, ctx: &egui::Context) {
+        let (hovered, dropped) = ctx.input(|i| (i.raw.hovered_files.clone(), i.raw.dropped_files.clone()));
+
+        if !hovered.is_empty() {
+            let screen_rect = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drag_drop_overlay"),
+            ));
+            painter.rect_filled(
+                screen_rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(10, 18, 28, 195),
+            );
+            painter.rect_stroke(
+                screen_rect.shrink(18.0),
+                12.0,
+                Stroke::new(2.5_f32, Color32::from_rgb(0, 220, 255)),
+            );
+
+            let label = hovered
+                .first()
+                .and_then(|f| f.path.as_ref())
+                .and_then(|p| p.file_name())
+                .map(|n| format!("📂 放開滑鼠以載入影片：{}", n.to_string_lossy()))
+                .unwrap_or_else(|| "📂 放開滑鼠以載入影片檔案".to_string());
+
+            painter.text(
+                screen_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(24.0),
+                Color32::from_rgb(0, 235, 255),
+            );
+        }
+
+        if !dropped.is_empty() {
+            let mut loaded = false;
+            for item in &dropped {
+                if let Some(path) = &item.path {
+                    if Self::is_supported_video_file(path) {
+                        self.load_video_file(path.clone());
+                        loaded = true;
+                        break;
+                    }
+                }
+            }
+            if !loaded {
+                self.status_message = "不支援的檔案格式，請拖曳影片檔案 (.mp4, .mkv, .avi, .mov, .ts)".to_string();
+            }
+        }
+    }
+
     /// 匯入全車完整參數檔
     pub fn import_calibration_profile(&mut self) {
         if let Some(file) = rfd::FileDialog::new()
@@ -222,17 +360,7 @@ impl DashCamApp {
             match std::fs::read_to_string(&file) {
                 Ok(json_str) => match serde_json::from_str::<CalibrationProfile>(&json_str) {
                     Ok(profile) => {
-                        self.mapping = profile.mapping;
-                        self.camera_params = profile.preview_camera_params;
-                        self.birdview_camera_params = profile.birdview_camera_params;
-                        self.birdview.seam_spread = profile.birdview_seam_spread;
-                        self.birdview.uv_road_split = profile.birdview_uv_road_split;
-                        self.birdview.show_guides = profile.birdview_show_guides;
-                        self.birdview.seam_lines = profile.birdview_seam_lines;
-                        self.viewer.mirror_offset_z = profile.viewer_mirror_offset_z;
-                        self.viewer.floor_radius = profile.viewer_floor_radius;
-                        self.viewer.wall_radius = profile.viewer_wall_radius;
-                        self.viewer.wall_height = profile.viewer_wall_height;
+                        self.apply_calibration_profile(profile);
                         self.status_message = format!(
                             "已成功匯入參數檔: {}",
                             file.file_name().unwrap_or_default().to_string_lossy()
@@ -250,6 +378,10 @@ impl DashCamApp {
     }
 }
 
+fn default_bowl_strength() -> f32 { 0.0 }
+fn default_seam_sharpness() -> f32 { 2.5 }
+fn default_auto_gain() -> bool { true }
+
 /// 匯出/匯入用的全車參數設定結構
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct CalibrationProfile {
@@ -261,6 +393,12 @@ pub struct CalibrationProfile {
     pub birdview_uv_road_split: f32,
     pub birdview_show_guides: bool,
     pub birdview_seam_lines: bool,
+    #[serde(default = "default_bowl_strength")]
+    pub birdview_bowl_strength: f32,
+    #[serde(default = "default_seam_sharpness")]
+    pub birdview_seam_sharpness: f32,
+    #[serde(default = "default_auto_gain")]
+    pub birdview_auto_gain: bool,
     pub viewer_mirror_offset_z: f32,
     pub viewer_floor_radius: f32,
     pub viewer_wall_radius: f32,
@@ -270,7 +408,13 @@ pub struct CalibrationProfile {
 impl eframe::App for DashCamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_worker_messages();
+        self.handle_drag_and_drop(ctx);
         self.player.update_textures(ctx);
+        self.birdview.update_auto_gain(
+            &self.player.latest_frames,
+            &self.birdview_camera_params,
+            self.player.frame_gen,
+        );
 
         let tex_ids = [
             self.player.textures[0].as_ref().map(|t| t.id()),
@@ -633,11 +777,7 @@ impl DashCamApp {
                                     .add_filter("Video", &["mp4", "mkv", "avi", "mov", "ts"])
                                     .pick_file()
                                 {
-                                    let d = probe_video_duration(&file);
-                                    self.input_duration_sec = d;
-                                    self.input_path = Some(file.clone());
-                                    self.player.load_quad_video(file, self.mapping.clone());
-                                    self.status_message = "已直接加載影片四路完整魚眼串流，隨時可校正".to_string();
+                                    self.load_video_file(file);
                                 }
                             }
                             if ui.button("🎲 產生測試樣品").clicked() {
@@ -969,7 +1109,7 @@ impl DashCamApp {
                     ui.separator();
 
                     // 鳥瞰拼接輔助微調
-                    ui.label(RichText::new("🌿 鳥瞰扇區展開角度與裁切高度").strong());
+                    ui.label(RichText::new("🌿 鳥瞰扇區展開角度與 3D 碗狀融合").strong());
                     ui.horizontal(|ui| {
                         ui.label("前後扇區張角:");
                         ui.add(egui::Slider::new(&mut self.birdview.seam_spread, 0.40..=1.35).suffix("x"))
@@ -980,6 +1120,51 @@ impl DashCamApp {
                         ui.add(egui::Slider::new(&mut self.birdview.uv_road_split, 0.2..=0.85).suffix(" ratio"))
                             .on_hover_text("調整路面在鳥瞰圖中的有效取景高度 (避免遠方天空進入地面拼接)");
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("3D 碗狀曲面:");
+                        ui.add(egui::Slider::new(&mut self.birdview.bowl_strength, 0.0..=1.0))
+                            .on_hover_text("近處維持平坦 Z=0 確保車道線筆直，遠處平滑上彎以減少放射狀拉伸 (0 = 純平面)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("接縫銳利度:");
+                        ui.add(egui::Slider::new(&mut self.birdview.seam_sharpness, 1.0..=6.0))
+                            .on_hover_text("提高數值可收窄重疊過渡帶，減少鄰車或路緣重影");
+                    });
+                    ui.checkbox(&mut self.birdview.auto_gain, "自動亮度與白平衡增益補償 (Auto Gain)")
+                        .on_hover_text("依據四路重疊區亮度與色溫自動均衡四路畫面，消除十字色差");
+
+                    ui.add_space(6.0);
+                    let has_all_frames = self.player.latest_frames.iter().all(|f| f.is_some());
+                    let btn_auto_align = egui::Button::new(
+                        RichText::new("✨ 一鍵自動對齊四路外參 (Auto Align)")
+                            .strong()
+                            .size(13.0),
+                    )
+                    .min_size(Vec2::new(ui.available_width(), 32.0))
+                    .fill(Color32::from_rgb(0, 145, 110));
+                    if ui
+                        .add_enabled(has_all_frames, btn_auto_align)
+                        .on_hover_text("利用目前畫面的重疊區域地面紋理，自動優化四路 Yaw/Pitch/Roll 與 X/Y 偏移")
+                        .clicked()
+                    {
+                        match auto_align_extrinsics(
+                            &self.player.latest_frames,
+                            &mut self.birdview_camera_params,
+                        ) {
+                            Ok(report) => {
+                                self.status_message = format!(
+                                    "✨ 自動對齊完成！重疊誤差降低 {:.1}% (RMSE {:.1} → {:.1}, {} 取樣點)",
+                                    report.improved_pct,
+                                    report.before_rmse,
+                                    report.after_rmse,
+                                    report.overlap_samples
+                                );
+                            }
+                            Err(e) => {
+                                self.status_message = format!("自動對齊失敗: {}", e);
+                            }
+                        }
+                    }
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1313,11 +1498,7 @@ impl DashCamApp {
                                 .add_filter("Video", &["mp4", "mkv", "avi", "mov", "ts"])
                                 .pick_file()
                             {
-                                let d = probe_video_duration(&file);
-                                self.input_duration_sec = d;
-                                self.input_path = Some(file.clone());
-                                self.player.load_quad_video(file, self.mapping.clone());
-                                self.status_message = "已直接加載影片四路完整魚眼串流".to_string();
+                                self.load_video_file(file);
                             }
                         }
                         if ui.button("🎲 產生測試樣品").clicked() {
